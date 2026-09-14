@@ -109,6 +109,10 @@ def create_completion_event(
     exit_code: int | None,
     launch_error: str | None,
     wake_id: str,
+    execution_attempts: list[dict[str, object]] | None = None,
+    monitor_plan_file: str | None = None,
+    monitor_triage: list[dict[str, object]] | None = None,
+    monitor_error: str | None = None,
 ) -> Path:
     destination = completion_path(log_file)
     atomic_write_json(destination, {
@@ -121,6 +125,13 @@ def create_completion_event(
         "completed_at": utc_now(),
         "wake_id": wake_id,
         "log_file": str(log_file),
+        "execution_attempts": execution_attempts or [],
+        "monitor": {
+            "enabled": monitor_plan_file is not None,
+            "plan_file": monitor_plan_file,
+            "triage": monitor_triage or [],
+            "error": monitor_error,
+        },
         "delivery": {
             "state": DELIVERY_PENDING,
             "attempts": 0,

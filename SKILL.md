@@ -1,11 +1,16 @@
 ---
 name: wake-run
-description: Launch long-running experiments or scripts in a detached background watcher, end the current Codex turn immediately after launch, and wake the same Codex thread when the process exits successfully or fails. Use when the user explicitly asks for wake-run, background experiment execution without polling, or an event-driven continuation after a long command finishes.
+description: Launch long-running experiments or scripts in a detached background watcher, optionally use a lower-cost Codex session for event-driven result triage and explicitly authorized exact retries, then wake the originating thread. Use when the user asks for wake-run, economical monitoring, background execution without polling, or event-driven continuation after a long command finishes.
 ---
 
 # Wake Run
 
 Run long commands without model polling. The bundled watcher waits on the operating system process-exit event and uses `codex queue` to inject a fixed wake-up message into the originating Codex thread.
+
+Two modes are available:
+
+- Direct mode queues every completion event to the originating thread.
+- Economical monitoring creates a separate, lower-cost Codex session before launch. The worker resumes it only after an execution attempt finishes, accepts a structured decision, and may repeat the exact command only when the main agent explicitly authorized that action.
 
 ## Launch workflow
 
@@ -16,9 +21,12 @@ Run long commands without model polling. The bundled watcher waits on the operat
 python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 ```
 
+   When the user requests economical monitoring, first read [references/economic-monitor.md](references/economic-monitor.md), create the explicit monitor-plan JSON it describes, and add `--monitor-plan <absolute-plan-path>`. Never infer permission to retry from a general request to monitor.
+
 3. Read the launcher's JSON response.
    - `status: armed` means both the detached worker and its target process started successfully. The response includes both PIDs.
    - If `status` is `armed`, immediately end the current turn.
+   - In economical mode, `armed.monitor` identifies the fixed model, monitor session, runtime plan, and policy hash.
    - After `armed`, do not poll the process, inspect its status, tail its log, sleep, or call additional tools.
    - Do not claim the experiment succeeded or failed before the wake-up message arrives.
    - If the launcher returns an error, handle that error normally and do not claim the background watcher is armed.
@@ -32,10 +40,13 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 
 - Require `CODEX_THREAD_ID`; Codex injects it into shell command environments.
 - Require a Codex CLI version that supports `codex queue`. The launcher verifies this before starting the experiment.
+- Economical mode additionally requires persistent `codex exec` sessions, structured output, and `codex exec resume`. Monitor creation is synchronous and must succeed before the target starts; the launcher never silently falls back to direct mode or another model.
 - Interpret experiment commands with PowerShell on Windows and `bash -o pipefail` on POSIX (falling back to `$SHELL` if bash is unavailable). Pipeline failures (e.g. `eda_tool ... | tee run.log`) are therefore not masked by a successful `tee`.
 - Support Windows Codex shims, including `codex.ps1`; invoke `.ps1` shims through PowerShell rather than passing them directly to `CreateProcess`.
 - Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied. On POSIX the directory and files use modes `0700` and `0600`.
 - Commands and thread identifiers are stored verbatim in local state. Pass secrets through the environment or protected files instead of embedding them in the command text.
+- A monitor receives only the configured tail of the execution log as untrusted evidence. Its session uses the read-only sandbox, and every decision is checked against the persisted plan before the worker acts.
+- Monitor-role environments cannot invoke wake-run in either launch or replay mode. Exact retries are performed inside the existing worker and never create another watcher or monitor.
 - Persist `<run-id>.completion.json` before delivery. Its delivery state moves through `pending`, `delivering`, and `delivered`; delivery attempts and the last error remain inspectable.
 - Retry transient delivery failures within `WAKE_RUN_QUEUE_TIMEOUT` (30 minutes by default). The startup handshake defaults to 10 seconds and can be configured with `WAKE_RUN_STARTUP_TIMEOUT`. Both values must be finite positive numbers.
 - If an event remains undelivered, retry it explicitly with `python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>`. Concurrent delivery of the same event is locked; a replay reports `replay_incomplete` while another live process owns it.

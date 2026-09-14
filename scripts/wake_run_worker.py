@@ -14,8 +14,11 @@ from wake_run_state import create_completion_event, open_private_log, write_star
 
 WORKER_DELIVERY_FAILURE = 70
 WORKER_STATE_FAILURE = 74
+WORKER_MONITOR_FAILURE = 75
 WORKER_STARTUP_FAILURE = 127
 WORKER_STOP_TIMEOUT = 5
+TRIAGE_RETRY_EXACT = "retry_exact"
+TRIAGE_TERMINAL_ACTIONS = frozenset({"report_success", "escalate"})
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,7 @@ class WorkerRequest:
     codex_bin: str
     run_id: str
     startup_file: Path | None
+    monitor_plan_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -44,8 +48,28 @@ class StateFailure:
     error: str
 
 
+@dataclass(frozen=True)
+class TriageDecision:
+    action: str
+    summary: str
+    reason: str
+    failure_category: str
+    model: str
+    session_id: str
+    policy_hash: str
+
+
+@dataclass(frozen=True)
+class WorkerOutcome:
+    result: ExecutionResult
+    attempts: tuple[dict[str, object], ...]
+    triage: tuple[dict[str, object], ...]
+    monitor_error: str | None
+
+
 CompletionDelivery = Callable[[Path, str], None]
 StateFailureNotifier = Callable[[StateFailure], int]
+TriageCallback = Callable[[WorkerRequest, ExecutionResult, int], TriageDecision]
 
 
 def _error_text(error: Exception) -> str:
@@ -64,6 +88,8 @@ def _terminate_unarmed_process(process: subprocess.Popen[bytes]) -> None:
 def _start_process(
     request: WorkerRequest,
     log: BinaryIO,
+    *,
+    confirm_startup: bool,
 ) -> tuple[subprocess.Popen[bytes] | None, str | None, bool]:
     try:
         process = subprocess.Popen(
@@ -74,8 +100,8 @@ def _start_process(
             stderr=subprocess.STDOUT,
         )
     except Exception as error:
-        return None, _error_text(error), request.startup_file is None
-    if request.startup_file is None:
+        return None, _error_text(error), not confirm_startup
+    if not confirm_startup or request.startup_file is None:
         return process, None, True
     try:
         write_startup_status(
@@ -92,11 +118,24 @@ def _start_process(
     return process, None, True
 
 
-def _execute(request: WorkerRequest) -> ExecutionResult:
+def _execute(
+    request: WorkerRequest,
+    *,
+    attempt_number: int,
+    confirm_startup: bool,
+) -> ExecutionResult:
     try:
         with open_private_log(request.log_file) as log:
-            log.write(f"$ {request.command}\n".encode("utf-8", errors="replace"))
-            process, error, startup_confirmed = _start_process(request, log)
+            log.write(
+                f"\n[wake-run] execution attempt {attempt_number}\n$ {request.command}\n".encode(
+                    "utf-8", errors="replace"
+                )
+            )
+            process, error, startup_confirmed = _start_process(
+                request,
+                log,
+                confirm_startup=confirm_startup,
+            )
             if error is not None:
                 log.write(f"\n[wake-run] execution failed: {error}\n".encode("utf-8"))
                 return ExecutionResult(None, error, startup_confirmed)
@@ -108,7 +147,58 @@ def _execute(request: WorkerRequest) -> ExecutionResult:
                 log.write(f"\n[wake-run] process wait failed: {error}\n".encode("utf-8"))
                 return ExecutionResult(None, error, startup_confirmed)
     except Exception as error:
-        return ExecutionResult(None, _error_text(error), request.startup_file is None)
+        return ExecutionResult(None, _error_text(error), not confirm_startup)
+
+
+def _attempt_record(number: int, result: ExecutionResult) -> dict[str, object]:
+    return {
+        "attempt": number,
+        "exit_code": result.exit_code,
+        "error": result.error,
+    }
+
+
+def _decision_record(attempt: int, decision: TriageDecision) -> dict[str, object]:
+    return {
+        "attempt": attempt,
+        "action": decision.action,
+        "summary": decision.summary,
+        "reason": decision.reason,
+        "failure_category": decision.failure_category,
+        "model": decision.model,
+        "session_id": decision.session_id,
+        "policy_hash": decision.policy_hash,
+    }
+
+
+def _execute_attempts(
+    request: WorkerRequest,
+    triage: TriageCallback | None,
+) -> WorkerOutcome:
+    attempts: list[dict[str, object]] = []
+    decisions: list[dict[str, object]] = []
+    retry_count = 0
+    while True:
+        attempt_number = retry_count + 1
+        result = _execute(
+            request,
+            attempt_number=attempt_number,
+            confirm_startup=attempt_number == 1 and request.startup_file is not None,
+        )
+        attempts.append(_attempt_record(attempt_number, result))
+        if not result.startup_confirmed or triage is None:
+            return WorkerOutcome(result, tuple(attempts), tuple(decisions), None)
+        try:
+            decision = triage(request, result, retry_count)
+            decisions.append(_decision_record(attempt_number, decision))
+            if decision.action == TRIAGE_RETRY_EXACT:
+                retry_count += 1
+                continue
+            if decision.action not in TRIAGE_TERMINAL_ACTIONS:
+                raise RuntimeError(f"Unknown monitor decision: {decision.action}")
+            return WorkerOutcome(result, tuple(attempts), tuple(decisions), None)
+        except Exception as error:
+            return WorkerOutcome(result, tuple(attempts), tuple(decisions), _error_text(error))
 
 
 def _report_startup_failure(request: WorkerRequest, result: ExecutionResult) -> int:
@@ -126,7 +216,7 @@ def _report_startup_failure(request: WorkerRequest, result: ExecutionResult) -> 
 
 def _persist_completion(
     request: WorkerRequest,
-    result: ExecutionResult,
+    outcome: WorkerOutcome,
     wake_id: str,
 ) -> Path:
     return create_completion_event(
@@ -134,9 +224,13 @@ def _persist_completion(
         run_id=request.run_id,
         thread_id=request.thread_id,
         command=request.command,
-        exit_code=result.exit_code,
-        launch_error=result.error,
+        exit_code=outcome.result.exit_code,
+        launch_error=outcome.result.error,
         wake_id=wake_id,
+        execution_attempts=list(outcome.attempts),
+        monitor_plan_file=str(request.monitor_plan_file) if request.monitor_plan_file else None,
+        monitor_triage=list(outcome.triage),
+        monitor_error=outcome.monitor_error,
     )
 
 
@@ -145,13 +239,15 @@ def run_worker(
     *,
     deliver: CompletionDelivery,
     notify_state_failure: StateFailureNotifier,
+    triage: TriageCallback | None = None,
 ) -> int:
-    result = _execute(request)
+    outcome = _execute_attempts(request, triage)
+    result = outcome.result
     if not result.startup_confirmed:
         return _report_startup_failure(request, result)
     wake_id = uuid.uuid4().hex
     try:
-        completion_file = _persist_completion(request, result, wake_id)
+        completion_file = _persist_completion(request, outcome, wake_id)
     except Exception as error:
         state_error = _error_text(error)
         with open_private_log(request.log_file) as log:
@@ -165,4 +261,6 @@ def run_worker(
         return WORKER_DELIVERY_FAILURE
     if result.error is not None:
         return WORKER_STARTUP_FAILURE
+    if outcome.monitor_error is not None:
+        return WORKER_MONITOR_FAILURE
     return result.exit_code if result.exit_code is not None else 1

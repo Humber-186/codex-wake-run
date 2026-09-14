@@ -12,7 +12,7 @@
 
 在 agent 会话里跑长实验，通常只有两种难受的选择：要么让模型停在轮询循环里，一轮一轮地等；要么放弃这条线程，等结果出来之后重新把任务背景讲一遍。
 
-wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启动一个分离的守护进程并完成短暂的启动握手；只有目标进程已经存在时才打印 `status: armed`，随后当前轮次结束。守护进程阻塞在操作系统的进程退出事件上。命令结束时，无论成功还是失败，守护进程都会先持久化完成事件，再用 `codex queue` 把唤醒消息注入原线程。模型带着完整上下文接着做原来的任务。
+wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启动一个分离的守护进程并完成短暂的启动握手；只有目标进程已经存在时才打印 `status: armed`，随后当前轮次结束。守护进程阻塞在操作系统的进程退出事件上。命令结束时，无论成功还是失败，守护进程都会先持久化完成事件，再用 `codex queue` 把唤醒消息注入原线程。也可以显式启用经济看护，让 Luna 等低成本模型只在执行事件发生后分诊结果，并在有限授权下重试完全相同的命令。
 
 ## 核心特性
 
@@ -24,6 +24,8 @@ wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启�
 | 失败始终可见 | 命令非零退出会唤醒线程；worker 或目标进程启动失败会在返回 `armed` 前同步报错。 |
 | Windows 与 POSIX 双支持 | Windows 走 PowerShell，POSIX 走 `bash -o pipefail`，并正确处理 `codex.ps1` shim。 |
 | 持久化投递状态 | 每次运行具有独立日志和原子 completion JSON，记录投递次数、错误与最终状态。 |
+| 可选经济看护 | 独立的低成本 Codex 会话按事件分诊；模型、证据范围和原命令重试次数均由主 agent 的计划明确授权。 |
+| 结构化递归防护 | 监护角色不能再次启动或补发 wake-run；重试由现有 worker 内部执行，不会创建嵌套 watcher。 |
 
 ## 架构
 
@@ -42,7 +44,13 @@ wake_run.py launcher
     ▼
 退出码 + 日志
     │
-    │ 持久化完成事件 + codex queue
+    ├─ 直接模式：持久化完成事件
+    │
+    └─ 经济看护：恢复只读监护会话
+            ├─ 已授权 retry_exact ──► 原命令再次执行
+            └─ 成功 / 升级 / 监护异常
+    │
+    │ codex queue
     ▼
 Codex 被唤醒并继续原任务
 ```
@@ -92,6 +100,33 @@ Codex 根据需要读取日志，然后继续原任务。
 python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <运行状态目录>
 ```
 
+## 经济看护
+
+经济看护不是模型轮询器。操作系统 watcher 仍然通过 `process.wait()` 等待，监护模型只在一次执行结束后调用。主 agent 先创建严格的 JSON 计划：
+
+```json
+{
+  "schema_version": 1,
+  "model": "gpt-5.6-luna",
+  "instructions": "成功时总结结果；只对明确的瞬时外部服务故障重试，其他失败升级主 agent。",
+  "allowed_actions": ["retry_exact"],
+  "max_exact_retries": 1,
+  "log_tail_bytes": 65536
+}
+```
+
+然后显式启用：
+
+```bash
+python3 <skill-dir>/scripts/wake_run.py \
+  --command '<完全确定的命令>' \
+  --monitor-plan '<计划 JSON 的绝对路径>'
+```
+
+launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话；失败时明确报错，不会退回直接模式或替换模型。监护输出必须是 `report_success`、`retry_exact` 或 `escalate` 之一。worker 会校验运行标识、计划哈希、退出状态、错误分类与剩余授权；模型不能提供修改后的命令，启动或 wait 异常也不能自动重试。监护调用或协议失败会写入 completion 并唤醒主线程。
+
+当前模式只监护进程结束事件，不宣称检测运行中的无响应任务。完整计划约定见 [`references/economic-monitor.md`](./references/economic-monitor.md)。
+
 ## 快速开始
 
 这个仓库本身就是一个独立 Skill，不需要 `.codex-plugin`，也没有额外的 `skills/wake-run` 套娃目录。
@@ -112,6 +147,7 @@ python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <运行状态�
 
 - **只能在 Codex 会话内工作。** Skill 依赖 `CODEX_THREAD_ID` 判断应该唤醒哪条线程。
 - **Codex CLI 需要支持 `codex queue`。** 启动器会在实验启动前预检。
+- **经济看护还需要持久 `codex exec` 会话、结构化输出和 `codex exec resume`。** 监护调用超时由显式的 `WAKE_RUN_MONITOR_TIMEOUT` 控制，默认 300 秒。
 - **它不是绕过沙箱的手段。** 后台进程继承启动环境及其权限。
 - **每个实验一个 watcher。** 任务确实需要时可以并行运行多个。
 
@@ -122,12 +158,15 @@ python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <运行状态�
 | [`SKILL.md`](./SKILL.md) | Skill 指令：启动流程、运行时约定、唤醒消息结构。 |
 | [`scripts/wake_run.py`](./scripts/wake_run.py) | 命令行入口。 |
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | 启动握手、唤醒投递与补发。 |
+| [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | 监护计划、Codex 会话、结构化分诊与递归防护。 |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | 目标进程执行与完成事件持久化。 |
 | [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | 原子状态持久化、文件权限与投递锁。 |
 | [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows 与 POSIX 命令构造。 |
 | [`agents/openai.yaml`](./agents/openai.yaml) | 面向 agent 的 Skill 元数据，已开启隐式调用。 |
 | [`tests/test_wake_run.py`](./tests/test_wake_run.py) | 单元测试、集成测试、Windows 回归测试。 |
 | [`tests/test_recovery.py`](./tests/test_recovery.py) | 恢复、持久化失败与补发测试。 |
+| [`tests/test_monitor.py`](./tests/test_monitor.py) | 经济看护计划、协议、授权重试和端到端测试。 |
+| [`references/economic-monitor.md`](./references/economic-monitor.md) | 经济看护计划与决策契约。 |
 
 运行日志写入启动任务所在项目的 `.codex-wake-run/` 目录，该目录已被 gitignore。
 

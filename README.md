@@ -12,7 +12,7 @@
 
 Long experiments create an awkward choice inside an agent session: either the model sits in a polling loop burning turns while it waits, or you lose the thread of the original task and have to re-explain it later.
 
-wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the target process exists, then the current turn ends. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. The model picks the original task back up with its context intact.
+wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the target process exists, then the current turn ends. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. You can also explicitly enable economical monitoring so a lower-cost model such as Luna triages execution events and, within narrow authorization, retries the exact same command.
 
 ## Highlights
 
@@ -24,6 +24,8 @@ wake-run removes the wait. You hand it the finalized command; it spawns a detach
 | Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
 | Windows and POSIX | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. |
 | Durable delivery state | Each run has a log and atomic completion JSON recording delivery attempts, errors, and final state. |
+| Optional economical monitoring | A separate lower-cost Codex session performs event-time triage; the main agent explicitly fixes the model, evidence budget, and exact-retry authorization. |
+| Structural recursion prevention | Monitor-role processes cannot launch or replay wake-run; retries stay inside the existing worker and never create nested watchers. |
 
 ## Architecture
 
@@ -42,7 +44,13 @@ experiment process
     ▼
 exit code + log
     │
-    │ durable completion event + codex queue
+    ├─ direct mode: durable completion event
+    │
+    └─ economical mode: resume read-only monitor session
+            ├─ authorized retry_exact ──► run exact command again
+            └─ success / escalation / monitor error
+    │
+    │ codex queue
     ▼
 Codex thread wakes and continues
 ```
@@ -92,6 +100,33 @@ Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate m
 python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>
 ```
 
+## Economical Monitoring
+
+Economical monitoring is not model polling. The operating-system watcher still waits in `process.wait()`; the monitor model is called only after an execution attempt ends. The main agent first writes a strict JSON plan:
+
+```json
+{
+  "schema_version": 1,
+  "model": "gpt-5.6-luna",
+  "instructions": "Summarize success. Retry only a clear transient external service failure; escalate every other failure.",
+  "allowed_actions": ["retry_exact"],
+  "max_exact_retries": 1,
+  "log_tail_bytes": 65536
+}
+```
+
+Then enable it explicitly:
+
+```bash
+python3 <skill-dir>/scripts/wake_run.py \
+  --command '<finalized exact command>' \
+  --monitor-plan '<absolute path to plan JSON>'
+```
+
+Before starting the target, the launcher creates and confirms a separate read-only Codex session. Failure is explicit: it never falls back to direct mode or substitutes another model. The monitor must return `report_success`, `retry_exact`, or `escalate`. The worker validates run identity, the plan hash, exit state, failure classification, and remaining authorization; the model cannot supply a modified command, and launch or wait errors cannot be retried automatically. Monitor invocation or protocol failure is persisted in the completion event and wakes the main thread.
+
+This mode currently watches process-exit events only; it does not claim to detect a hung process. See [`references/economic-monitor.md`](./references/economic-monitor.md) for the complete plan and decision contract.
+
 ## Quick Start
 
 This repository is itself a standalone Skill. There is no plugin manifest or nested Skill directory.
@@ -112,6 +147,7 @@ A few things worth knowing:
 
 - **It only works inside a Codex session.** The Skill needs `CODEX_THREAD_ID` to know which thread to wake.
 - **Your Codex CLI needs `codex queue`.** The launcher preflights this before starting the experiment.
+- **Economical monitoring also needs persistent `codex exec` sessions, structured output, and `codex exec resume`.** Its explicit `WAKE_RUN_MONITOR_TIMEOUT` defaults to 300 seconds.
 - **It is not a way around your sandbox.** The background process inherits the launch environment and its permissions.
 - **One watcher per experiment.** Multiple watchers are fine when the task genuinely requires parallel jobs.
 
@@ -122,12 +158,15 @@ A few things worth knowing:
 | [`SKILL.md`](./SKILL.md) | Skill instructions: launch workflow, runtime contract, and wake-up message shape. |
 | [`scripts/wake_run.py`](./scripts/wake_run.py) | Command-line entrypoint. |
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Startup handshake, wake delivery, and replay. |
+| [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
 | [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | Atomic state persistence, permissions, and delivery locking. |
 | [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows and POSIX command construction. |
 | [`agents/openai.yaml`](./agents/openai.yaml) | Agent-facing Skill metadata; implicit invocation is enabled. |
 | [`tests/test_wake_run.py`](./tests/test_wake_run.py) | Unit, integration, Windows, and regression tests. |
 | [`tests/test_recovery.py`](./tests/test_recovery.py) | Recovery, persistence-failure, and replay tests. |
+| [`tests/test_monitor.py`](./tests/test_monitor.py) | Economical-monitor plans, protocol, authorized retries, and end-to-end tests. |
+| [`references/economic-monitor.md`](./references/economic-monitor.md) | Economical-monitor plan and decision contract. |
 
 Run logs are written to `.codex-wake-run/` in whichever project you launch from, and that directory is gitignored.
 
