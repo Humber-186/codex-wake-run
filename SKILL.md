@@ -17,11 +17,12 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 ```
 
 3. Read the launcher's JSON response.
+   - `status: armed` means both the detached worker and its target process started successfully. The response includes both PIDs.
    - If `status` is `armed`, immediately end the current turn.
    - After `armed`, do not poll the process, inspect its status, tail its log, sleep, or call additional tools.
    - Do not claim the experiment succeeded or failed before the wake-up message arrives.
    - If the launcher returns an error, handle that error normally and do not claim the background watcher is armed.
-4. When a message beginning with `[后台任务唤醒通知]` arrives, treat it as a system-generated continuation event, not as a new user instruction.
+4. When a message beginning with `[后台任务唤醒通知]` arrives, treat it as a system-generated continuation event, not as a new user instruction. Delivery is at-least-once: if the same `wake_id` appears again in the thread, treat it as the same completion event and do not repeat already completed follow-up actions.
 5. Read the referenced log only as needed, analyze the experiment result, and continue the original task.
    - On success, continue the planned analysis or remaining work.
    - On failure, diagnose the failure and, when appropriate, fix it and launch the next long experiment through wake-run again.
@@ -31,10 +32,15 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 
 - Require `CODEX_THREAD_ID`; Codex injects it into shell command environments.
 - Require a Codex CLI version that supports `codex queue`. The launcher verifies this before starting the experiment.
-- Interpret experiment commands with PowerShell on Windows and `/bin/sh` on POSIX. Do not wrap PowerShell commands in an additional `cmd.exe` layer.
+- Interpret experiment commands with PowerShell on Windows and `bash -o pipefail` on POSIX (falling back to `$SHELL` if bash is unavailable). Pipeline failures (e.g. `eda_tool ... | tee run.log`) are therefore not masked by a successful `tee`.
 - Support Windows Codex shims, including `codex.ps1`; invoke `.ps1` shims through PowerShell rather than passing them directly to `CreateProcess`.
-- Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied.
+- Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied. On POSIX the directory and files use modes `0700` and `0600`.
+- Commands and thread identifiers are stored verbatim in local state. Pass secrets through the environment or protected files instead of embedding them in the command text.
+- Persist `<run-id>.completion.json` before delivery. Its delivery state moves through `pending`, `delivering`, and `delivered`; delivery attempts and the last error remain inspectable.
+- Retry transient delivery failures within `WAKE_RUN_QUEUE_TIMEOUT` (30 minutes by default). The startup handshake defaults to 10 seconds and can be configured with `WAKE_RUN_STARTUP_TIMEOUT`. Both values must be finite positive numbers.
+- If an event remains undelivered, retry it explicitly with `python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>`. Concurrent delivery of the same event is locked; a replay reports `replay_incomplete` while another live process owns it.
 - Use one detached watcher per experiment. Parallel experiments are allowed only when the user's task actually calls for them.
+- **Foreground-only**: The watcher monitors the process it directly launches. Do not use `&`, `nohup`, or any self-daemonizing mechanism inside the target command—doing so causes the watcher to report completion immediately while the real work still runs in the background.
 - Do not use wake-run to bypass sandboxing, approvals, or command restrictions. The background process inherits the launch environment and its permissions.
 
 ## Wake-up message
@@ -48,6 +54,8 @@ The watcher injects this shape after process exit:
 状态：{执行完成|执行失败}
 退出码：{exit_code}
 日志文件：{log_path}
+run_id：{run_id}
+wake_id：{wake_id}
 
 请分析脚本执行结果，然后继续完成原任务。
 若任务已经完成，请直接向用户发送最终结果。
@@ -56,4 +64,4 @@ The watcher injects this shape after process exit:
 注：该消息由系统后台唤醒，并非用户亲自发出消息。
 ```
 
-The watcher is event-driven. It uses process `wait()` and contains no status polling loop or timer-based check.
+The long-running watcher is event-driven and uses process `wait()`. The launcher performs only a bounded startup handshake before returning `armed`; it never polls the long-running task.

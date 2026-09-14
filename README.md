@@ -12,18 +12,18 @@
 
 Long experiments create an awkward choice inside an agent session: either the model sits in a polling loop burning turns while it waits, or you lose the thread of the original task and have to re-explain it later.
 
-wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher, prints `status: armed`, and the current turn ends right away. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher uses `codex queue` to inject a wake-up message back into the same thread that launched it, carrying the exit code and log path. The model picks the original task back up with its context intact.
+wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the target process exists, then the current turn ends. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. The model picks the original task back up with its context intact.
 
 ## Highlights
 
 | Highlight | Why it matters |
 |---|---|
-| Event-driven, not polled | The watcher blocks on `process.wait()`. There is no sleep loop, timer, or status check in the runtime. |
-| The turn ends immediately | The launcher spawns a detached worker, prints one JSON line, and exits, so no model turn is spent waiting. |
+| Event-driven long jobs | The watcher blocks on `process.wait()`; only the bounded startup handshake checks a status file. |
+| Strict startup confirmation | `armed` is returned only after the worker reports the target process PID. Startup failure and timeout are explicit errors. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job. |
-| Failures wake you too | A non-zero exit and a failed process launch both produce a wake-up message. |
-| Windows and POSIX | Commands run through PowerShell on Windows and `/bin/sh` on POSIX, including `codex.ps1` shim handling. |
-| One log per run | Each run streams stdout and stderr into `<cwd>/.codex-wake-run/<run_id>.log`. |
+| Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
+| Windows and POSIX | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. |
+| Durable delivery state | Each run has a log and atomic completion JSON recording delivery attempts, errors, and final state. |
 
 ## Architecture
 
@@ -34,7 +34,7 @@ Codex thread
     ▼
 wake_run.py launcher
     │
-    │ detached worker, then current turn ends
+    │ detached worker + target PID handshake
     ▼
 experiment process
     │
@@ -42,7 +42,7 @@ experiment process
     ▼
 exit code + log
     │
-    │ codex queue --thread <originating thread>
+    │ durable completion event + codex queue
     ▼
 Codex thread wakes and continues
 ```
@@ -60,7 +60,7 @@ Use the wake-run skill to run this experiment and continue after it exits.
 **Codex** launches the job and gets `armed` back:
 
 ```json
-{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log"}
+{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log"}
 ```
 
 It then ends the turn. Nothing polls the job.
@@ -74,6 +74,8 @@ When the script exits, the watcher queues a wake-up into that same thread:
 状态：执行完成
 退出码：0
 日志文件：/work/project/.codex-wake-run/b7599ab35869.log
+run_id：b7599ab35869
+wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
 
 请分析脚本执行结果，然后继续完成原任务。
 若任务已经完成，请直接向用户发送最终结果。
@@ -83,6 +85,12 @@ When the script exits, the watcher queues a wake-up into that same thread:
 ```
 
 Codex reads the referenced log when needed and continues the original task.
+
+Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate messages represent the same completion event and must not repeat completed follow-up work. Before each delivery attempt, `<run_id>.completion.json` records `pending`, `delivering`, or `delivered` plus attempt details. Undelivered events can be retried explicitly:
+
+```bash
+python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>
+```
 
 ## Quick Start
 
@@ -112,9 +120,14 @@ A few things worth knowing:
 | Path | What it holds |
 |---|---|
 | [`SKILL.md`](./SKILL.md) | Skill instructions: launch workflow, runtime contract, and wake-up message shape. |
-| [`scripts/wake_run.py`](./scripts/wake_run.py) | Launcher and detached watcher. |
+| [`scripts/wake_run.py`](./scripts/wake_run.py) | Command-line entrypoint. |
+| [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Startup handshake, wake delivery, and replay. |
+| [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
+| [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | Atomic state persistence, permissions, and delivery locking. |
+| [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows and POSIX command construction. |
 | [`agents/openai.yaml`](./agents/openai.yaml) | Agent-facing Skill metadata; implicit invocation is enabled. |
 | [`tests/test_wake_run.py`](./tests/test_wake_run.py) | Unit, integration, Windows, and regression tests. |
+| [`tests/test_recovery.py`](./tests/test_recovery.py) | Recovery, persistence-failure, and replay tests. |
 
 Run logs are written to `.codex-wake-run/` in whichever project you launch from, and that directory is gitignored.
 
