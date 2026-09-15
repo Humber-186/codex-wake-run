@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import datetime
 import json
 import os
@@ -17,6 +18,10 @@ DELIVERY_STATES = frozenset({DELIVERY_PENDING, DELIVERY_IN_PROGRESS, DELIVERY_DE
 SCHEMA_VERSION = 1
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+ERROR_ACCESS_DENIED = 5
+ERROR_INVALID_PARAMETER = 87
 
 
 class DeliveryInProgressError(RuntimeError):
@@ -172,22 +177,53 @@ def update_delivery(
     atomic_write_json(path, {**payload, "delivery": delivery})
 
 
-def undelivered_completion_files(log_dir: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in sorted(log_dir.glob("*.completion.json")):
-        payload = read_json(path)
-        delivery = payload.get("delivery")
-        if not isinstance(delivery, dict):
-            raise RuntimeError(f"Missing delivery state in {path}")
-        state = delivery.get("state")
-        if state not in DELIVERY_STATES:
-            raise RuntimeError(f"Invalid delivery state in {path}: {state}")
-        if state != DELIVERY_DELIVERED:
-            files.append(path)
-    return files
+def completion_files(log_dir: Path) -> list[Path]:
+    return sorted(log_dir.glob("*.completion.json"))
+
+
+def completion_is_undelivered(path: Path) -> bool:
+    payload = read_json(path)
+    delivery = payload.get("delivery")
+    if not isinstance(delivery, dict):
+        raise RuntimeError(f"Missing delivery state in {path}")
+    state = delivery.get("state")
+    if state not in DELIVERY_STATES:
+        raise RuntimeError(f"Invalid delivery state in {path}: {state}")
+    return state != DELIVERY_DELIVERED
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == ERROR_INVALID_PARAMETER:
+            return False
+        if error == ERROR_ACCESS_DENIED:
+            return True
+        raise ctypes.WinError(error)
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

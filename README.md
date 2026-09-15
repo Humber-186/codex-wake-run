@@ -12,17 +12,17 @@
 
 Long experiments create an awkward choice inside an agent session: either the model sits in a polling loop burning turns while it waits, or you lose the thread of the original task and have to re-explain it later.
 
-wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the target process exists, then the current turn ends. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. You can also explicitly enable economical monitoring so a lower-cost model such as Luna triages execution events and, within narrow authorization, retries the exact same command.
+wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the monitored shell process starts and the watcher owns its eventual exit status, then the current turn ends. This does not prove that the underlying application initialized, acquired a license, or passed configuration checks. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. You can also explicitly enable economical monitoring so a lower-cost model such as Luna triages execution events and, within narrow authorization, retries the exact same command.
 
 ## Highlights
 
 | Highlight | Why it matters |
 |---|---|
 | Event-driven long jobs | The watcher blocks on `process.wait()`; only the bounded startup handshake checks a status file. |
-| Strict startup confirmation | `armed` is returned only after the worker reports the target process PID. Startup failure and timeout are explicit errors. |
+| Strict startup confirmation | `armed` is returned only after the worker reports the monitored shell PID. Startup failure and timeout are explicit errors. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job. |
 | Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
-| Windows and POSIX | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. |
+| Windows and POSIX paths | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. CI defines both platforms; release confidence depends on actual Actions results. |
 | Durable delivery state | Each run has a log and atomic completion JSON recording delivery attempts, errors, and final state. |
 | Optional economical monitoring | A separate lower-cost Codex session performs event-time triage; the main agent explicitly fixes the model, evidence budget, and exact-retry authorization. |
 | Structural recursion prevention | Monitor-role processes cannot launch or replay wake-run; retries stay inside the existing worker and never create nested watchers. |
@@ -92,7 +92,7 @@ wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
 注：该消息由系统后台唤醒，并非用户亲自发出消息。
 ```
 
-Codex reads the referenced log when needed and continues the original task.
+After receiving `armed`, Codex sends one concise confirmation and ends the current turn. It reads the referenced log only after the wake-up arrives, then continues the original task.
 
 Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate messages represent the same completion event and must not repeat completed follow-up work. Before each delivery attempt, `<run_id>.completion.json` records `pending`, `delivering`, or `delivered` plus attempt details. Undelivered events can be retried explicitly:
 
@@ -123,7 +123,9 @@ python3 <skill-dir>/scripts/wake_run.py \
   --monitor-plan '<absolute path to plan JSON>'
 ```
 
-Before starting the target, the launcher creates and confirms a separate read-only Codex session. Failure is explicit: it never falls back to direct mode or substitutes another model. The monitor must return `report_success`, `retry_exact`, or `escalate`. The worker validates run identity, the plan hash, exit state, failure classification, and remaining authorization; the model cannot supply a modified command, and launch or wait errors cannot be retried automatically. Monitor invocation or protocol failure is persisted in the completion event and wakes the main thread.
+Before starting the target, the launcher creates and confirms a separate read-only Codex session. Every resume explicitly reapplies the read-only sandbox, fixed state-directory cwd, and non-Git-directory allowance. Failure is explicit: it never falls back to direct mode or substitutes another model. The monitor must return `report_success`, `retry_exact`, or `escalate`. The worker validates run identity, the plan hash, exit state, failure classification, and remaining authorization; the model cannot supply a modified command, and launch or wait errors cannot be retried automatically. Monitor invocation or protocol failure is persisted in the completion event and wakes the main thread.
+
+Authorize `retry_exact` only when repeating the complete command is safe even if the prior attempt produced partial side effects. A transient external failure does not prove that no side effect occurred; deployment, publishing, payment, and database-migration commands should normally disallow automatic retries.
 
 This mode currently watches process-exit events only; it does not claim to detect a hung process. See [`references/economic-monitor.md`](./references/economic-monitor.md) for the complete plan and decision contract.
 
@@ -134,7 +136,7 @@ This repository is itself a standalone Skill. There is no plugin manifest or nes
 Ask Codex to install it:
 
 ```text
-Install the wake-run skill for me: https://github.com/ZardLi1115/codex-wake-run
+Install the wake-run skill for me: https://github.com/Humber-186/codex-wake-run
 ```
 
 Once installed, use it like this:
@@ -160,15 +162,17 @@ A few things worth knowing:
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Startup handshake, wake delivery, and replay. |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
+| [`scripts/wake_run_process.py`](./scripts/wake_run_process.py) | Cross-platform target process groups and failure cleanup. |
 | [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | Atomic state persistence, permissions, and delivery locking. |
 | [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows and POSIX command construction. |
 | [`agents/openai.yaml`](./agents/openai.yaml) | Agent-facing Skill metadata; implicit invocation is enabled. |
 | [`tests/test_wake_run.py`](./tests/test_wake_run.py) | Unit, integration, Windows, and regression tests. |
 | [`tests/test_recovery.py`](./tests/test_recovery.py) | Recovery, persistence-failure, and replay tests. |
 | [`tests/test_monitor.py`](./tests/test_monitor.py) | Economical-monitor plans, protocol, authorized retries, and end-to-end tests. |
+| [`tests/test_process.py`](./tests/test_process.py) | POSIX and Windows process-tree cleanup tests. |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | Economical-monitor plan and decision contract. |
 
-Run logs are written to `.codex-wake-run/` in whichever project you launch from, and that directory is gitignored.
+Run logs default to `.codex-wake-run/` in the project you launch from. This repository ignores that directory, but a host project does not inherit this repository's `.gitignore`; add `.codex-wake-run/` to the host project yourself. For large EDA projects, `--log-dir ~/.codex/wake-run/<project>` keeps frequently updated state off the source tree or NFS storage.
 
 ## Acknowledgements
 

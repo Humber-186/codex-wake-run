@@ -128,7 +128,6 @@ class QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "preflight timed out"):
             wake_run.preflight_codex_queue("codex")
 
-
 class CompletionStateTests(unittest.TestCase):
     def create_event(self, directory: Path) -> Path:
         return wake_state.create_completion_event(
@@ -334,7 +333,6 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "finite number"):
                 wake_run.startup_timeout_from_environment()
 
-
 class ReplayTests(unittest.TestCase):
     def test_replay_delivers_pending_and_skips_delivered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -423,7 +421,7 @@ class IntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             fake_codex = self.create_fake_codex(directory)
-            with self.assertRaisesRegex(RuntimeError, "No such file or directory"):
+            with self.assertRaisesRegex(RuntimeError, "does not exist or is not a directory"):
                 wake_run.arm_watcher(
                     thread_id="thread",
                     command="echo never-started",
@@ -431,6 +429,8 @@ class IntegrationTests(unittest.TestCase):
                     log_dir=directory / "state",
                     codex_bin=str(fake_codex),
                 )
+            self.assertFalse((directory / "missing-cwd").exists())
+            self.assertFalse((directory / "state").exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX executable integration test")
     def test_worker_cli_sends_queue_and_persists_delivery(self) -> None:

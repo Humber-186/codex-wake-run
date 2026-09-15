@@ -18,11 +18,12 @@ from wake_run_state import (
     DELIVERY_IN_PROGRESS,
     DELIVERY_PENDING,
     DeliveryInProgressError,
+    completion_files,
+    completion_is_undelivered,
     delivery_lock,
     ensure_private_directory,
     open_private_log,
     read_json,
-    undelivered_completion_files,
     update_delivery,
     write_startup_status,
 )
@@ -36,6 +37,7 @@ from wake_run_worker import (
     run_worker as execute_worker,
 )
 from wake_run_monitor import MonitorPolicy, create_monitor_session, triage_execution
+from wake_run_process import terminate_process_tree
 
 WAKE_HEADER = "[后台任务唤醒通知]"
 SYSTEM_NOTE = "注：该消息由系统后台唤醒，并非用户亲自发出消息。"
@@ -167,7 +169,8 @@ def _attempt_queue(thread_id: str, message: str, resolved_codex: str, *, timeout
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=timeout,
         )
@@ -358,14 +361,7 @@ def _wait_for_startup(
 
 
 def _stop_worker(worker: subprocess.Popen[bytes]) -> None:
-    if worker.poll() is not None:
-        return
-    worker.terminate()
-    try:
-        worker.wait(timeout=WORKER_STOP_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        worker.kill()
-        worker.wait()
+    terminate_process_tree(worker, timeout=WORKER_STOP_TIMEOUT)
 
 
 def _validate_startup_status(
@@ -391,6 +387,9 @@ def arm_watcher(
     codex_bin: str,
     monitor_policy: MonitorPolicy | None = None,
 ) -> dict[str, object]:
+    if not cwd.is_dir():
+        raise RuntimeError(f"Working directory does not exist or is not a directory: {cwd}")
+    resolved_cwd = cwd.resolve(strict=True)
     resolved_codex = preflight_codex_queue(codex_bin)
     ensure_private_directory(log_dir)
     run_id = uuid.uuid4().hex[:12]
@@ -400,7 +399,7 @@ def arm_watcher(
             policy=monitor_policy,
             run_id=run_id,
             root_thread_id=thread_id,
-            cwd=cwd,
+            cwd=resolved_cwd,
             log_dir=log_dir,
             resolved_codex=resolved_codex,
         )
@@ -418,7 +417,7 @@ def arm_watcher(
         "--worker",
         "--command", command,
         "--thread-id", thread_id,
-        "--cwd", str(cwd),
+        "--cwd", str(resolved_cwd),
         "--log-file", str(log_file),
         "--codex-bin", resolved_codex,
         "--run-id", run_id,
@@ -474,8 +473,10 @@ def replay_pending(*, log_dir: Path, codex_bin: str) -> dict[str, object]:
     delivered: list[str] = []
     busy: list[str] = []
     failures: dict[str, str] = {}
-    for completion_file in undelivered_completion_files(log_dir):
+    for completion_file in completion_files(log_dir):
         try:
+            if not completion_is_undelivered(completion_file):
+                continue
             deliver_completion(completion_file, resolved_codex)
             delivered.append(completion_file.name)
         except DeliveryInProgressError as exc:

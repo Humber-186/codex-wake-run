@@ -1,11 +1,13 @@
 name: test
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
 
 jobs:
   unit:
+    timeout-minutes: 10
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]

@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import BinaryIO, Callable
 
 from wake_run_platform import build_experiment_invocation
+from wake_run_process import ProcessTreeSignalGuard, target_popen_kwargs, terminate_process_tree
 from wake_run_state import create_completion_event, open_private_log, write_startup_status
 
 WORKER_DELIVERY_FAILURE = 70
 WORKER_STATE_FAILURE = 74
 WORKER_MONITOR_FAILURE = 75
 WORKER_STARTUP_FAILURE = 127
-WORKER_STOP_TIMEOUT = 5
 TRIAGE_RETRY_EXACT = "retry_exact"
 TRIAGE_TERMINAL_ACTIONS = frozenset({"report_success", "escalate"})
 
@@ -76,18 +76,19 @@ def _error_text(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-def _terminate_unarmed_process(process: subprocess.Popen[bytes]) -> None:
-    process.terminate()
+def _cleanup_failure(process: subprocess.Popen[bytes], error: Exception) -> str:
+    primary = _error_text(error)
     try:
-        process.wait(timeout=WORKER_STOP_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+        terminate_process_tree(process)
+    except Exception as cleanup_error:
+        return f"{primary}; process-tree cleanup failed: {_error_text(cleanup_error)}"
+    return primary
 
 
 def _start_process(
     request: WorkerRequest,
     log: BinaryIO,
+    signal_guard: ProcessTreeSignalGuard,
     *,
     confirm_startup: bool,
 ) -> tuple[subprocess.Popen[bytes] | None, str | None, bool]:
@@ -98,7 +99,9 @@ def _start_process(
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
+            **target_popen_kwargs(),
         )
+        signal_guard.attach(process)
     except Exception as error:
         return None, _error_text(error), not confirm_startup
     if not confirm_startup or request.startup_file is None:
@@ -113,7 +116,7 @@ def _start_process(
         )
     except Exception as error:
         if process.poll() is None:
-            _terminate_unarmed_process(process)
+            return None, _cleanup_failure(process, error), False
         return None, _error_text(error), False
     return process, None, True
 
@@ -131,21 +134,23 @@ def _execute(
                     "utf-8", errors="replace"
                 )
             )
-            process, error, startup_confirmed = _start_process(
-                request,
-                log,
-                confirm_startup=confirm_startup,
-            )
-            if error is not None:
-                log.write(f"\n[wake-run] execution failed: {error}\n".encode("utf-8"))
-                return ExecutionResult(None, error, startup_confirmed)
-            assert process is not None
-            try:
-                return ExecutionResult(process.wait(), None, startup_confirmed)
-            except Exception as wait_error:
-                error = _error_text(wait_error)
-                log.write(f"\n[wake-run] process wait failed: {error}\n".encode("utf-8"))
-                return ExecutionResult(None, error, startup_confirmed)
+            with ProcessTreeSignalGuard() as signal_guard:
+                process, error, startup_confirmed = _start_process(
+                    request,
+                    log,
+                    signal_guard,
+                    confirm_startup=confirm_startup,
+                )
+                if error is not None:
+                    log.write(f"\n[wake-run] execution failed: {error}\n".encode("utf-8"))
+                    return ExecutionResult(None, error, startup_confirmed)
+                assert process is not None
+                try:
+                    return ExecutionResult(process.wait(), None, startup_confirmed)
+                except Exception as wait_error:
+                    error = _cleanup_failure(process, wait_error)
+                    log.write(f"\n[wake-run] process wait failed: {error}\n".encode("utf-8"))
+                    return ExecutionResult(None, error, startup_confirmed)
     except Exception as error:
         return ExecutionResult(None, _error_text(error), not confirm_startup)
 

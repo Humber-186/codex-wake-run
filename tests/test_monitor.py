@@ -108,6 +108,26 @@ class MonitorPolicyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("may not launch another wake-run", result.stderr)
 
+    def test_cli_rejects_recursive_hidden_worker_mode(self) -> None:
+        environment = {
+            **os.environ,
+            "WAKE_RUN_ROLE": "monitor",
+            "WAKE_RUN_MONITOR_DEPTH": "1",
+        }
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPT), "--worker", "--command", "echo never",
+                "--thread-id", "root", "--log-file", "never.log",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+            env=environment,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may not launch another wake-run", result.stderr)
+
 
 class MonitorSessionTests(unittest.TestCase):
     def create_runtime_plan(
@@ -134,6 +154,13 @@ class MonitorSessionTests(unittest.TestCase):
                 log_dir=directory,
                 resolved_codex="/codex",
             )
+
+    @mock.patch.object(monitor.subprocess, "run")
+    def test_codex_monitor_text_io_is_utf8(self, run: mock.Mock) -> None:
+        run.return_value = completed_codex()
+        monitor._run_codex(["codex", "exec", "-"], prompt="中文日志", run_id="run1")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
     def test_creates_hashed_runtime_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,9 +203,15 @@ class MonitorSessionTests(unittest.TestCase):
                 self.write_monitor_response(invocation, response)
                 return completed_codex()
 
-            with mock.patch.object(monitor, "_run_codex", side_effect=run_codex):
+            with mock.patch.object(monitor, "_run_codex", side_effect=run_codex) as codex_call:
                 decision = monitor.triage_execution(request, worker.ExecutionResult(0, None, True), 0)
+            invocation = codex_call.call_args.args[0]
         self.assertEqual(decision.action, "report_success")
+        resume_index = invocation.index("resume")
+        self.assertLess(invocation.index("--sandbox"), resume_index)
+        self.assertEqual(invocation[invocation.index("--sandbox") + 1], "read-only")
+        self.assertEqual(invocation[invocation.index("--cd") + 1], str(directory))
+        self.assertLess(invocation.index("--skip-git-repo-check"), resume_index)
 
     def test_unauthorized_retry_is_protocol_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,7 +333,7 @@ if args and args[0] == 'exec' and 'resume' not in args:
     output.write_text(json.dumps({{'status': 'monitor_ready'}}))
     print(json.dumps({{'type': 'thread.started', 'thread_id': 'monitor-integration'}}))
     raise SystemExit(0)
-if args[:2] == ['exec', 'resume']:
+if args and args[0] == 'exec' and 'resume' in args:
     output = pathlib.Path(args[args.index('--output-last-message') + 1])
     output.write_text(json.dumps({{
         'action': 'report_success', 'summary': 'integration complete',

@@ -190,7 +190,8 @@ def _run_codex(
             input=prompt,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=timeout,
             env=_monitor_environment(run_id),
@@ -431,11 +432,14 @@ def triage_execution(
     response_path = plan.path.with_name(f"{plan.run_id}.monitor-decision-{retry_count}.json")
     atomic_write_json(schema_path, _decision_schema())
     invocation = build_codex_invocation(request.codex_bin, [
-        "exec", "resume",
+        "exec", "--json",
         "--model", plan.policy.model,
+        "--sandbox", "read-only",
+        "--cd", str(plan.path.parent),
+        "--skip-git-repo-check",
         "--output-schema", str(schema_path),
         "--output-last-message", str(response_path),
-        "--json",
+        "resume",
         plan.session_id,
         "-",
     ])

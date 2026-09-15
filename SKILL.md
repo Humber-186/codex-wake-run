@@ -1,6 +1,6 @@
 ---
 name: wake-run
-description: Launch long-running experiments or scripts in a detached background watcher, optionally use a lower-cost Codex session for event-driven result triage and explicitly authorized exact retries, then wake the originating thread. Use when the user asks for wake-run, economical monitoring, background execution without polling, or event-driven continuation after a long command finishes.
+description: Run a finalized, non-interactive, long-running foreground command in a detached local watcher and wake the originating Codex thread when it exits, optionally with lower-cost event triage and explicitly authorized exact retries. Use for builds, simulations, tests, and experiments expected to outlive the current turn. Do not use for short commands, interactive or TUI programs, password or MFA prompts, self-daemonizing commands, or jobs that must survive a reboot.
 ---
 
 # Wake Run
@@ -24,8 +24,8 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
    When the user requests economical monitoring, first read [references/economic-monitor.md](references/economic-monitor.md), create the explicit monitor-plan JSON it describes, and add `--monitor-plan <absolute-plan-path>`. Never infer permission to retry from a general request to monitor.
 
 3. Read the launcher's JSON response.
-   - `status: armed` means both the detached worker and its target process started successfully. The response includes both PIDs.
-   - If `status` is `armed`, immediately end the current turn.
+   - `status: armed` means the detached worker launched the monitored shell process and now owns observation of its exit. It does not prove that the underlying application initialized, acquired a license, or passed configuration checks. The response includes both PIDs.
+   - If `status` is `armed`, send one concise user-facing confirmation such as `后台任务已启动（run_id: ...，日志: ...）。完成后会自动唤醒并继续处理。`, then immediately end the current turn.
    - In economical mode, `armed.monitor` identifies the fixed model, monitor session, runtime plan, and policy hash.
    - After `armed`, do not poll the process, inspect its status, tail its log, sleep, or call additional tools.
    - Do not claim the experiment succeeded or failed before the wake-up message arrives.
@@ -46,10 +46,11 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 - Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied. On POSIX the directory and files use modes `0700` and `0600`.
 - Commands and thread identifiers are stored verbatim in local state. Pass secrets through the environment or protected files instead of embedding them in the command text.
 - A monitor receives only the configured tail of the execution log as untrusted evidence. Its session uses the read-only sandbox, and every decision is checked against the persisted plan before the worker acts.
-- Monitor-role environments cannot invoke wake-run in either launch or replay mode. Exact retries are performed inside the existing worker and never create another watcher or monitor.
+- Monitor-role environments cannot invoke wake-run in any CLI mode, including the private worker entrypoint. Exact retries are performed inside the existing worker and never create another watcher or monitor.
 - Persist `<run-id>.completion.json` before delivery. Its delivery state moves through `pending`, `delivering`, and `delivered`; delivery attempts and the last error remain inspectable.
 - Retry transient delivery failures within `WAKE_RUN_QUEUE_TIMEOUT` (30 minutes by default). The startup handshake defaults to 10 seconds and can be configured with `WAKE_RUN_STARTUP_TIMEOUT`. Both values must be finite positive numbers.
 - If an event remains undelivered, retry it explicitly with `python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>`. Concurrent delivery of the same event is locked; a replay reports `replay_incomplete` while another live process owns it.
+- Replay reports each malformed completion file in `failures` and continues delivering other valid pending events.
 - Use one detached watcher per experiment. Parallel experiments are allowed only when the user's task actually calls for them.
 - **Foreground-only**: The watcher monitors the process it directly launches. Do not use `&`, `nohup`, or any self-daemonizing mechanism inside the target command—doing so causes the watcher to report completion immediately while the real work still runs in the background.
 - Do not use wake-run to bypass sandboxing, approvals, or command restrictions. The background process inherits the launch environment and its permissions.

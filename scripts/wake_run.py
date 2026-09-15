@@ -42,16 +42,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    cwd = Path(args.cwd).expanduser().resolve()
-    log_dir = Path(args.log_dir).expanduser().resolve() if args.log_dir else cwd / ".codex-wake-run"
-    if not args.worker:
-        reject_recursive_launch()
+    reject_recursive_launch()
     if args.replay_pending:
         if args.monitor_plan:
             raise SystemExit("--monitor-plan cannot be combined with --replay-pending")
+        log_dir = (
+            Path(args.log_dir).expanduser().resolve()
+            if args.log_dir
+            else Path(args.cwd).expanduser().resolve() / ".codex-wake-run"
+        )
         result = replay_pending(log_dir=log_dir, codex_bin=args.codex_bin)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0 if result["status"] == "replay_complete" else 70
+    raw_cwd = Path(args.cwd).expanduser()
+    if not raw_cwd.is_dir():
+        raise SystemExit(f"Working directory does not exist or is not a directory: {raw_cwd}")
+    cwd = raw_cwd.resolve(strict=True)
+    log_dir = Path(args.log_dir).expanduser().resolve() if args.log_dir else cwd / ".codex-wake-run"
     if args.worker:
         if not args.thread_id or not args.log_file or not args.command:
             raise SystemExit("worker mode requires --thread-id, --log-file, and --command")
