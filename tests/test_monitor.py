@@ -25,20 +25,33 @@ import wake_run_state as wake_state
 import wake_run_worker as worker
 
 
-def policy_payload(*, allow_retry: bool = True) -> dict[str, object]:
+def policy_payload(
+    *,
+    allow_retry: bool = True,
+    review_on: tuple[str, ...] = ("success", "failure"),
+) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": "gpt-5.6-luna",
         "instructions": "Retry only a clearly transient external failure.",
         "allowed_actions": ["retry_exact"] if allow_retry else [],
         "max_exact_retries": 1 if allow_retry else 0,
         "log_tail_bytes": 4096,
+        "review_on": list(review_on),
     }
 
 
-def write_policy(directory: Path, *, allow_retry: bool = True) -> Path:
+def write_policy(
+    directory: Path,
+    *,
+    allow_retry: bool = True,
+    review_on: tuple[str, ...] = ("success", "failure"),
+) -> Path:
     path = directory / "monitor-policy.json"
-    path.write_text(json.dumps(policy_payload(allow_retry=allow_retry)), encoding="utf-8")
+    path.write_text(
+        json.dumps(policy_payload(allow_retry=allow_retry, review_on=review_on)),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -51,8 +64,6 @@ def python_shell_command(source: str) -> str:
         executable = str(Path(sys.executable)).replace("'", "''")
         return f"& '{executable}' -c '{source.replace("'", "''")}'"
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
-
-
 class MonitorPolicyTests(unittest.TestCase):
     def test_loads_explicit_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,6 +71,17 @@ class MonitorPolicyTests(unittest.TestCase):
         self.assertEqual(policy.model, "gpt-5.6-luna")
         self.assertEqual(policy.allowed_actions, ("retry_exact",))
         self.assertEqual(policy.max_exact_retries, 1)
+        self.assertEqual(policy.review_on, ("success", "failure"))
+
+    def test_legacy_policy_keeps_reviewing_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.json"
+            payload = policy_payload()
+            payload["schema_version"] = 1
+            del payload["review_on"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            policy = monitor.load_monitor_policy(path)
+        self.assertEqual(policy.review_on, ("success", "failure"))
 
     def test_rejects_unknown_fields_and_inconsistent_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,33 +150,32 @@ class MonitorPolicyTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("may not launch another wake-run", result.stderr)
-
-
 class MonitorSessionTests(unittest.TestCase):
     def create_runtime_plan(
         self,
         directory: Path,
         *,
         allow_retry: bool = True,
+        review_on: tuple[str, ...] = ("success", "failure"),
+        prime_session: bool = True,
     ) -> monitor.RuntimeMonitorPlan:
-        policy = monitor.load_monitor_policy(write_policy(directory, allow_retry=allow_retry))
-        output = json.dumps({"type": "thread.started", "thread_id": "monitor-session"}) + "\n"
-        def initialize(invocation: list[str], **_kwargs):
-            response_index = invocation.index("--output-last-message") + 1
-            Path(invocation[response_index]).write_text(
-                json.dumps({"status": "monitor_ready"}), encoding="utf-8"
-            )
-            return completed_codex(output)
-
-        with mock.patch.object(monitor, "_run_codex", side_effect=initialize):
-            return monitor.create_monitor_session(
-                policy=policy,
-                run_id="run1",
-                root_thread_id="root-thread",
-                cwd=directory,
-                log_dir=directory,
-                resolved_codex="/codex",
-            )
+        policy = monitor.load_monitor_policy(
+            write_policy(directory, allow_retry=allow_retry, review_on=review_on)
+        )
+        plan = monitor.create_monitor_plan(
+            policy=policy,
+            run_id="run1",
+            root_thread_id="root-thread",
+            log_dir=directory,
+        )
+        if not prime_session:
+            return plan
+        runtime = wake_state.read_json(plan.runtime_path)
+        wake_state.atomic_write_json(
+            plan.runtime_path,
+            {**runtime, "session_id": "monitor-session"},
+        )
+        return monitor.read_runtime_plan(plan.path)
 
     @mock.patch.object(monitor.subprocess, "run")
     def test_codex_monitor_text_io_is_utf8(self, run: mock.Mock) -> None:
@@ -165,9 +186,11 @@ class MonitorSessionTests(unittest.TestCase):
 
     def test_creates_hashed_runtime_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            plan = self.create_runtime_plan(Path(tmp))
+            plan = self.create_runtime_plan(Path(tmp), prime_session=False)
             loaded = monitor.read_runtime_plan(plan.path)
-        self.assertEqual(loaded.session_id, "monitor-session")
+            runtime = wake_state.read_json(plan.runtime_path)
+        self.assertIsNone(loaded.session_id)
+        self.assertEqual(runtime["calls"], 0)
         self.assertEqual(loaded.root_thread_id, "root-thread")
         self.assertEqual(loaded.policy_hash, plan.policy_hash)
 
@@ -179,6 +202,29 @@ class MonitorSessionTests(unittest.TestCase):
             wake_state.atomic_write_json(plan.path, payload)
             with self.assertRaisesRegex(RuntimeError, "integrity check failed"):
                 monitor.read_runtime_plan(plan.path)
+
+    def test_failure_only_success_skips_codex_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            plan = self.create_runtime_plan(
+                directory,
+                allow_retry=False,
+                review_on=("failure",),
+                prime_session=False,
+            )
+            log = directory / "run.log"
+            log.write_text("done", encoding="utf-8")
+            request = worker.WorkerRequest(
+                "root-thread", "echo ok", directory, log, "/codex", "run1", None, plan.path
+            )
+            with mock.patch.object(monitor, "_run_codex") as codex_call:
+                decision = monitor.triage_execution(
+                    request, worker.ExecutionResult(0, None, True), 0
+                )
+            runtime = wake_state.read_json(plan.runtime_path)
+        self.assertIsNone(decision)
+        self.assertEqual(runtime["calls"], 0)
+        codex_call.assert_not_called()
 
     def write_monitor_response(self, invocation: list[str], payload: dict[str, str]) -> None:
         output_index = invocation.index("--output-last-message") + 1
@@ -367,17 +413,16 @@ import json, pathlib, sys
 args = sys.argv[1:]
 if args[:2] == ['queue', '--help']:
     raise SystemExit(0)
-if args and args[0] == 'exec' and 'resume' not in args:
-    output = pathlib.Path(args[args.index('--output-last-message') + 1])
-    output.write_text(json.dumps({{'status': 'monitor_ready'}}))
-    print(json.dumps({{'type': 'thread.started', 'thread_id': 'monitor-integration'}}))
+if args[:2] == ['exec', '--help'] or args[:3] == ['exec', 'resume', '--help']:
     raise SystemExit(0)
-if args and args[0] == 'exec' and 'resume' in args:
+if args and args[0] == 'exec' and '--output-last-message' in args:
     output = pathlib.Path(args[args.index('--output-last-message') + 1])
     output.write_text(json.dumps({{
         'action': 'report_success', 'summary': 'integration complete',
         'reason': 'zero exit', 'failure_category': 'none'
     }}))
+    if 'resume' not in args:
+        print(json.dumps({{'type': 'thread.started', 'thread_id': 'monitor-integration'}}))
     raise SystemExit(0)
 if args and args[0] == 'queue':
     pathlib.Path({str(capture)!r}).write_text(json.dumps(args))
@@ -418,17 +463,19 @@ raise SystemExit(2)
             completion = Path(str(armed["log_file"])).with_suffix(".completion.json")
             event = self.wait_for_completion(completion)
             queued = json.loads((directory / "queue.json").read_text(encoding="utf-8"))
-        self.assertEqual(armed["monitor"]["session_id"], "monitor-integration")
+        self.assertIsNone(armed["monitor"]["session_id"])
         self.assertEqual(event["monitor"]["triage"][-1]["summary"], "integration complete")
         self.assertEqual(queued[queued.index("--thread") + 1], "root-thread")
         wake_message = queued[queued.index("--message") + 1]
         self.assertTrue(wake_message.startswith("[后台任务完成-系统提示]"))
         self.assertIn("exit_code: 0", wake_message)
+        self.assertIn("monitor_summary: integration complete", wake_message)
+        self.assertIn("monitor_reason: zero exit", wake_message)
         self.assertRegex(wake_message, r"wall：\d+\.\d{3}s\nuser：\d+\.\d{3}s\nsys：\d+\.\d{3}s")
 
     @mock.patch.object(wake_launcher.subprocess, "Popen")
-    @mock.patch.object(wake_launcher, "create_monitor_session", side_effect=RuntimeError("monitor denied"))
-    def test_monitor_creation_failure_prevents_target_start(
+    @mock.patch.object(wake_launcher, "preflight_codex_monitor", side_effect=RuntimeError("monitor denied"))
+    def test_monitor_preflight_failure_prevents_target_start(
         self,
         _create: mock.Mock,
         popen: mock.Mock,

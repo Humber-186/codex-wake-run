@@ -139,8 +139,11 @@ def create_completion_event(
     execution_attempts: list[dict[str, object]] | None = None,
     monitor_plan_file: str | None = None,
     monitor_triage: list[dict[str, object]] | None = None,
+    monitor_status: str | None = None,
     monitor_error: str | None = None,
     goal_guard: dict[str, object] | None = None,
+    terminal_state: str = "completed",
+    observer_mode: str = "owned",
 ) -> Path:
     guard = goal_guard or {"mode": "not_needed", "verified": True, "lease_id": None}
     release_state = (
@@ -149,6 +152,7 @@ def create_completion_event(
     destination = completion_path(log_file)
     atomic_write_json(destination, {
         "schema_version": SCHEMA_VERSION,
+        "event_type": "process_exit",
         "run_id": run_id,
         "thread_id": thread_id,
         "command": command,
@@ -158,11 +162,15 @@ def create_completion_event(
         "user_seconds": user_seconds,
         "system_seconds": system_seconds,
         "completed_at": utc_now(),
+        "terminal_state": terminal_state,
+        "observer_mode": observer_mode,
+        "exact_exit_code_available": observer_mode != "adopted",
         "wake_id": wake_id,
         "log_file": str(log_file),
         "execution_attempts": execution_attempts or [],
         "monitor": {
             "enabled": monitor_plan_file is not None,
+            "status": monitor_status or ("pending" if monitor_plan_file else "disabled"),
             "plan_file": monitor_plan_file,
             "triage": monitor_triage or [],
             "error": monitor_error,
@@ -312,6 +320,14 @@ def _process_is_alive(pid: int) -> bool:
         return False
     if os.name == "nt":
         return _windows_process_is_alive(pid)
+    stat_path = Path("/proc") / str(pid) / "stat"
+    if stat_path.exists():
+        try:
+            _prefix, separator, suffix = stat_path.read_text(encoding="utf-8").rpartition(") ")
+            if separator and suffix.split()[0] == "Z":
+                return False
+        except FileNotFoundError:
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

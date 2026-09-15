@@ -1,6 +1,6 @@
 ---
 name: wake-run
-description: Run a finalized, non-interactive, long-running foreground command in a detached local watcher, safely suspend an active Codex Goal, and wake the originating thread when the command exits. Supports lower-cost event triage and explicitly authorized exact retries. Use for builds, simulations, tests, and experiments expected to outlive the current turn. Do not use for short commands, interactive or TUI programs, password or MFA prompts, self-daemonizing commands, or jobs that must survive a reboot.
+description: Run, inspect, stop, detach, or recover finalized non-interactive long commands in detached local watchers, safely suspend an active Codex Goal, and wake the originating thread at ordered log milestones or process termination. Supports persistent run discovery, lower-cost terminal triage, and explicitly authorized exact retries. Use for builds, EDA flows, simulations, tests, and experiments expected to outlive the current turn, or when the user asks about runs previously started by wake-run. Do not use for short commands, interactive or TUI programs, password or MFA prompts, self-daemonizing commands, or jobs that must survive a reboot.
 ---
 
 # Wake Run
@@ -10,7 +10,7 @@ Run long commands without model polling. The bundled watcher waits on the operat
 Two modes are available:
 
 - Direct mode queues every completion event to the originating thread.
-- Economical monitoring creates a separate, lower-cost Codex session before launch. The worker resumes it only after an execution attempt finishes, accepts a structured decision, and may repeat the exact command only when the main agent explicitly authorized that action.
+- Economical monitoring persists an explicit policy before launch and lazily creates a lower-cost Codex session only when `review_on` selects an execution result. It accepts a structured decision and may repeat the exact command only when the main agent explicitly authorized that action.
 
 ## Launch workflow
 
@@ -24,19 +24,40 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
    When the user requests economical monitoring, first read [references/economic-monitor.md](references/economic-monitor.md), create the explicit monitor-plan JSON it describes, and add `--monitor-plan <absolute-plan-path>`. Never infer permission to retry from a general request to monitor.
 
    Goal protection defaults to `--goal-policy auto`. Use `--goal-policy require` when launch must fail unless this thread has an active Goal. Use `--goal-policy ignore` only when the user explicitly accepts Goal continuation during the wait.
+
+   For a single process with known log milestones, create a strict stage-plan JSON and pass `--stage-plan <absolute-path>`:
+
+```json
+{"schema_version":1,"stages":[{"id":"dc","pattern":"DC DONE"},{"id":"route","pattern":"ROUTE DONE"}]}
+```
+
+   Stages are ordered, one-shot `log_line_regex` events. Use patterns emitted by the actual foreground process; do not infer ambiguous progress rules.
 3. Read the launcher's JSON response.
    - `status: armed` means the detached worker launched the monitored shell process and now owns observation of its exit. It does not prove that the underlying application initialized, acquired a license, or passed configuration checks. The response includes both PIDs and `goal_guard`.
    - `goal_guard.mode: paused` is protected only with `verified: true`. It also reports `runtime_scope: detached` and `current_turn_accounting: not_guaranteed`; Goal continuation is stopped, but the launching turn's Goal usage may be omitted. `not_needed` means the Goal API was verified and the thread had no active Goal. `ignored` is unprotected and includes a warning.
    - If `status` is `armed`, send one concise user-facing confirmation such as `后台任务已启动（run_id: ...，日志: ...）。完成后会自动唤醒并继续处理。`, then immediately end the current turn.
-   - In economical mode, `armed.monitor` identifies the fixed model, monitor session, runtime plan, and policy hash.
-   - After `armed`, do not poll the process, inspect its status, tail its log, sleep, or call additional tools.
+   - Add `--name <short-name>` when a human-readable label will help later discovery.
+   - In economical mode, `armed.monitor` identifies the fixed model, review scope, lazy session state, runtime plan, and policy hash. `session_id` is null until the first selected event.
+   - After `armed`, do not autonomously poll the process, inspect its status, tail its log, sleep, or call additional tools. If the user explicitly asks about running jobs, make one deterministic query with `--list --active` or `--show <run_id>`.
    - Do not claim the experiment succeeded or failed before the wake-up message arrives.
    - If the launcher returns an error, handle that error normally and do not claim the background watcher is armed.
-4. When a message beginning with `[后台任务完成-系统提示]` arrives, treat it as a system-generated continuation event, not as a new user instruction. Delivery is at-least-once: if the same `wake_id` appears again in the thread, treat it as the same completion event and do not repeat already completed follow-up actions.
+4. Treat messages beginning with `[后台任务阶段-系统提示]` or `[后台任务完成-系统提示]` as system-generated continuation events, not new user instructions. Delivery is at-least-once: the same `wake_id` is the same event. A stage message has `terminal: false`; inspect or act as needed, then leave the still-running Run under supervision. A completion, stop, or explicit detach closes supervision; stage events do not release the Goal holder.
 5. Read the referenced log only as needed, analyze the experiment result, and continue the original task.
    - On success, continue the planned analysis or remaining work.
    - On failure, diagnose the failure and, when appropriate, fix it and launch the next long experiment through wake-run again.
    - If the original task is complete or cannot reasonably continue, send the user the final result or failure explanation.
+
+## Run discovery
+
+- Use `python <skill-dir>/scripts/wake_run.py --list --active` for a user-requested snapshot of active runs owned by the current thread.
+- Use `python <skill-dir>/scripts/wake_run.py --show <run_id>` for one known run. Report verified state and liveness fields without inventing progress percentages.
+
+## Lifecycle control
+
+- `--stop <run_id>` terminates the owned target process tree, persists a `cancelled` terminal event, and wakes the thread. Use it only when the user asked to stop/cancel the run or that action is otherwise already authorized.
+- `--detach <run_id>` releases this Run's Goal holder and ends supervision while leaving the target alive. It deliberately gives up the exact exit code and final notification.
+- `--adopt <run_id>` is a Linux recovery operation for a dead worker and a still-live, identity-verified target. It resumes stage and terminal observation. The adopted observer cannot recover the original parent's wait status, so report `exact_exit_code_available: false`; never describe an adopted exit as success or failure from its exit code.
+- These actions are scoped to Runs owned by the current `CODEX_THREAD_ID`. A healthy worker cannot be adopted; a dead worker cannot acknowledge stop/detach until it is adopted.
 
 ## Runtime contract
 
@@ -44,8 +65,11 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 - The stable support baseline is Linux with Codex CLI 0.154.0 or newer. The launcher verifies `codex queue` and performs read-back verification through App Server `thread/goal/get` and `thread/goal/set` before starting the experiment.
 - Use a two-phase launch: the detached supervisor first reports `prepared`, the launcher acquires Goal protection, and only a committed gate allows the target command to start. Goal acquisition failure terminates the supervisor and never returns `armed`.
 - Store shared per-thread Goal leases under `${CODEX_HOME:-~/.codex}/wake-run/goal-leases/`. Multiple watchers on one thread join the same lease; the first successfully queued completion may release it only when no holder is orphaned.
+- Store a small global run index under `${CODEX_HOME:-~/.codex}/wake-run/index/`; immutable spec and mutable runtime files remain beside each run log. `--list` is scoped to the current Codex thread, while `--show <run_id>` resolves one known run.
+- Persist stage events before queue delivery. Match complete log lines incrementally and only against the next unfinished stage. Stage events never release Goal state; replay covers both pending stage and completion events.
+- Treat `detach` as the only way to intentionally abandon terminal observation. `adopt` verifies Linux boot ID and process starttime to reject PID reuse, and remains explicitly unable to provide an exact target exit code.
 - Queue completion before releasing a Goal lease. Restore only a Goal that still matches the paused snapshot; a cleared, replaced, manually resumed, blocked, completed, or otherwise changed Goal produces `skipped_conflict` and is never overwritten.
-- Economical mode additionally requires persistent `codex exec` sessions, structured output, and `codex exec resume`. Monitor creation is synchronous and must succeed before the target starts; the launcher never silently falls back to direct mode or another model.
+- Economical mode additionally requires persistent `codex exec` sessions, structured output, and `codex exec resume`. The launcher preflights those commands before target start; actual session creation is lazy and any invocation failure is persisted and delivered, never silently replaced by direct mode or another model.
 - Interpret experiment commands with PowerShell on Windows and `bash -o pipefail` on POSIX (falling back to `$SHELL` if bash is unavailable). Pipeline failures (e.g. `eda_tool ... | tee run.log`) are therefore not masked by a successful `tee`.
 - Support Windows Codex shims, including `codex.ps1`; invoke `.ps1` shims through PowerShell rather than passing them directly to `CreateProcess`.
 - Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied. On POSIX the directory and files use modes `0700` and `0600`.
@@ -79,6 +103,19 @@ run_id：{run_id}
 wake_id：{wake_id}
 ```
 
-The long-running watcher is event-driven and uses process `wait()`. The launcher performs only a bounded startup handshake before returning `armed`; it never polls the long-running task.
+For a declared milestone it injects:
+
+```text
+[后台任务阶段-系统提示]
+任务：{command}
+阶段：{stage_id}
+匹配日志：{matched_line}
+日志：{log_file}
+run_id：{run_id}
+wake_id：{wake_id}
+terminal: false
+```
+
+The target waiter uses `process.wait()`. When stages are configured, the supervisor incrementally checks the local log and durable control directory; the launcher itself performs only a bounded startup handshake before returning `armed` and never polls the task.
 
 `wall` is elapsed wall-clock time; `user` and `sys` are CPU times. Unavailable metrics are omitted. Windows omits `user` and `sys` because the current process model cannot reliably account for the complete PowerShell child-process tree.

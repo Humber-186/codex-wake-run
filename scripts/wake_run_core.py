@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from wake_run_platform import build_codex_invocation, resolve_codex_executable
+from wake_run_messages import build_stage_message, build_wake_message
 from wake_run_goal import (
     LEASE_PHASE_RESTORED,
     GoalGuardContext,
@@ -48,8 +49,8 @@ from wake_run_worker import (
     run_worker as execute_worker,
 )
 from wake_run_monitor import triage_execution
+from wake_run_events import event_is_delivered, stage_event_files
 
-WAKE_HEADER = "[后台任务完成-系统提示]"
 QUEUE_CALL_TIMEOUT, QUEUE_TOTAL_TIMEOUT = 30, 1800
 QUEUE_RETRY_DELAYS = (1, 2, 5, 10, 30, 60)
 PREFLIGHT_TIMEOUT, STARTUP_WAIT_TIMEOUT = 30, 10
@@ -89,43 +90,6 @@ def _validate_queue_policy(policy: QueuePolicy) -> None:
         raise RuntimeError("Queue timeouts must be greater than zero")
     if any(delay < 0 for delay in policy.retry_delays):
         raise RuntimeError("Queue retry delays must not be negative")
-
-
-def build_wake_message(
-    command: str,
-    exit_code: int | None,
-    log_file: Path,
-    *,
-    duration_seconds: float | None = None,
-    user_seconds: float | None = None,
-    system_seconds: float | None = None,
-    run_id: str = "",
-    wake_id: str = "",
-) -> str:
-    lines = [
-        WAKE_HEADER,
-        f"任务：{command}",
-        f"日志：{log_file}",
-        f"exit_code: {exit_code}",
-    ]
-    lines.extend(
-        f"{label}：{_format_duration(value)}"
-        for label, value in (
-            ("wall", duration_seconds),
-            ("user", user_seconds),
-            ("sys", system_seconds),
-        )
-        if value is not None
-    )
-    lines.extend([
-        f"run_id：{run_id}",
-        f"wake_id：{wake_id}",
-    ])
-    return "\n".join(lines)
-
-
-def _format_duration(duration_seconds: float) -> str:
-    return f"{duration_seconds:.3f}s"
 
 
 def preflight_codex_queue(codex_bin: str) -> str:
@@ -211,6 +175,8 @@ def queue_wakeup(
 
 
 def _event_message(event: dict[str, object]) -> str:
+    if event.get("event_type") == "stage":
+        return build_stage_message(event)
     return build_wake_message(
         str(event["command"]),
         event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
@@ -232,6 +198,9 @@ def _event_message(event: dict[str, object]) -> str:
         ),
         run_id=str(event["run_id"]),
         wake_id=str(event["wake_id"]),
+        monitor=event.get("monitor") if isinstance(event.get("monitor"), dict) else None,
+        terminal_state=str(event.get("terminal_state", "completed")),
+        observer_mode=str(event.get("observer_mode", "owned")),
     )
 
 
@@ -245,6 +214,18 @@ def deliver_completion(completion_file: Path, codex_bin: str) -> None:
             _deliver_wake_event(completion_file, codex_bin, event, delivery)
             event = read_json(completion_file)
         _release_event_goal(completion_file, codex_bin, event)
+
+
+def deliver_stage_event(event_file: Path, codex_bin: str) -> None:
+    with delivery_lock(event_file):
+        event = read_json(event_file)
+        if event.get("event_type") != "stage":
+            raise RuntimeError(f"Not a stage event: {event_file}")
+        delivery = event.get("delivery")
+        if not isinstance(delivery, dict):
+            raise RuntimeError(f"Missing delivery state in {event_file}")
+        if delivery.get("state") != DELIVERY_DELIVERED:
+            _deliver_wake_event(event_file, codex_bin, event, delivery)
 
 
 def _deliver_wake_event(
@@ -379,6 +360,8 @@ def run_worker(
     monitor_plan_file: Path | None = None,
     gate_file: Path | None = None,
     launcher_pid: int | None = None,
+    runtime_file: Path | None = None,
+    stage_plan_file: Path | None = None,
 ) -> int:
     request = WorkerRequest(
         thread_id=thread_id,
@@ -391,12 +374,15 @@ def run_worker(
         monitor_plan_file=monitor_plan_file,
         gate_file=gate_file,
         launcher_pid=launcher_pid,
+        runtime_file=runtime_file,
+        stage_plan_file=stage_plan_file,
     )
     return execute_worker(
         request,
         deliver=deliver_completion,
         notify_state_failure=_notify_state_failure,
         triage=triage_execution if monitor_plan_file else None,
+        deliver_stage=deliver_stage_event,
     )
 
 
@@ -406,11 +392,17 @@ def replay_pending(*, log_dir: Path, codex_bin: str) -> dict[str, object]:
     delivered: list[str] = []
     busy: list[str] = []
     failures: dict[str, str] = {}
-    for completion_file in completion_files(log_dir):
+    event_files = [*stage_event_files(log_dir), *completion_files(log_dir)]
+    for completion_file in event_files:
         try:
-            if not completion_is_undelivered(completion_file):
-                continue
-            deliver_completion(completion_file, resolved_codex)
+            if completion_file.name.endswith(".event.json"):
+                if event_is_delivered(completion_file):
+                    continue
+                deliver_stage_event(completion_file, resolved_codex)
+            else:
+                if not completion_is_undelivered(completion_file):
+                    continue
+                deliver_completion(completion_file, resolved_codex)
             delivered.append(completion_file.name)
         except DeliveryInProgressError as exc:
             busy.append(str(exc))

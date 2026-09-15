@@ -8,9 +8,10 @@ Create a JSON file with exactly these fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model": "gpt-5.6-luna",
-  "instructions": "Summarize success. Retry only a clearly transient external service failure. Escalate every task, code, configuration, dependency, permission, repeated, or ambiguous failure.",
+  "review_on": ["failure"],
+  "instructions": "Retry only a clearly transient external service failure. Escalate every task, code, configuration, dependency, permission, repeated, or ambiguous failure.",
   "allowed_actions": ["retry_exact"],
   "max_exact_retries": 1,
   "log_tail_bytes": 65536
@@ -18,6 +19,7 @@ Create a JSON file with exactly these fields:
 ```
 
 - Preserve the model requested by the user. `gpt-5.6-luna` is the usual economical choice, not a silent substitute for another requested model.
+- `review_on` accepts `success` and `failure`. Use `["failure"]` for the usual zero-call success path; include `success` only when a model-written success summary is useful. Schema 1 plans remain valid and review both outcomes.
 - Make `instructions` task-specific enough to distinguish a known transient external failure from a task failure.
 - `allowed_actions` currently accepts only `retry_exact`. Use an empty array when the monitor is read-only.
 - Set `max_exact_retries` to `0` unless `retry_exact` is present. Any positive value is an explicit authorization boundary chosen for this task.
@@ -34,7 +36,7 @@ python3 <skill-dir>/scripts/wake_run.py \
 
 ## Decision contract
 
-The monitor runs in a separate persistent Codex session with the configured model and a read-only sandbox. The worker reapplies the read-only sandbox, fixed state-directory cwd, and non-Git-directory allowance on every resume. It is invoked only after an execution attempt and must return one structured action:
+The launcher validates `codex exec` and `codex exec resume` support, then persists immutable policy separately from mutable monitor runtime. A monitor session is created lazily by the first event selected by `review_on`; that first call performs triage directly, without a readiness-only model turn. Later exact retries resume the same session. Every call uses the configured model, read-only sandbox, fixed state-directory cwd, and non-Git-directory allowance.
 
 - `report_success`: valid only for exit code zero with no execution error.
 - `retry_exact`: valid only for a process that completed with a nonzero exit code and was classified as `transient_external`, when the plan authorizes it and a retry remains. Launch and wait errors are always escalated because the prior process state may be uncertain.
@@ -46,4 +48,4 @@ The worker validates the action, classification, success state, remaining author
 
 Monitor calls carry `WAKE_RUN_ROLE=monitor`, the root run ID, and monitor depth `1`. Every wake-run CLI mode rejects that role or any positive monitor depth. A retry is an internal new attempt of the same command and run; it does not invoke the Skill, create a watcher, or create another monitor.
 
-Completion state records every execution attempt, monitor decision, model, session ID, policy hash, and monitor error. Delivery remains at-least-once under the original `wake_id`; duplicate wake messages must not repeat follow-up work.
+Completion state records every execution attempt, monitor status, decision, model, session ID, policy hash, and monitor error. The wake message includes the latest action, category, summary, and reason when a review ran; a skipped success is reported as `monitor_status: skipped_success`. Delivery remains at-least-once under the original `wake_id`; duplicate wake messages must not repeat follow-up work.

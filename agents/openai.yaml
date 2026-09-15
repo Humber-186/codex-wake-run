@@ -1,5 +1,5 @@
 interface:
   display_name: "Wake Run"
-  short_description: "Run long jobs and wake Codex on exit"
+  short_description: "Run long jobs with milestone wakes and control"
 policy:
   allow_implicit_invocation: true

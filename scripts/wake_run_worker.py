@@ -6,13 +6,27 @@ import os
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
 
 from wake_run_metrics import collect_metrics, cpu_usage_snapshot
+from wake_run_attempts import execute_attempts
+from wake_run_models import (
+    ExecutionResult,
+    StateFailure,
+    TriageDecision,
+    WorkerOutcome,
+    WorkerRequest,
+)
 from wake_run_platform import build_experiment_invocation
-from wake_run_process import ProcessTreeSignalGuard, target_popen_kwargs, terminate_process_tree
+from wake_run_process import (
+    ProcessTreeSignalGuard,
+    optional_process_identity,
+    target_popen_kwargs,
+    terminate_process_tree,
+)
+from wake_run_registry import write_run_runtime
+from wake_run_supervisor import supervise_owned_process
 from wake_run_goal import (
     GoalGuardContext,
     cancel_goal_guard,
@@ -31,73 +45,28 @@ WORKER_DELIVERY_FAILURE = 70
 WORKER_STATE_FAILURE = 74
 WORKER_MONITOR_FAILURE = 75
 WORKER_STARTUP_FAILURE = 127
-TRIAGE_RETRY_EXACT = "retry_exact"
-TRIAGE_TERMINAL_ACTIONS = frozenset({"report_success", "escalate"})
 GATE_CHECK_INTERVAL = 0.05
-
-
-@dataclass(frozen=True)
-class WorkerRequest:
-    thread_id: str
-    command: str
-    cwd: Path
-    log_file: Path
-    codex_bin: str
-    run_id: str
-    startup_file: Path | None
-    monitor_plan_file: Path | None = None
-    gate_file: Path | None = None
-    launcher_pid: int | None = None
-
-
-@dataclass(frozen=True)
-class ExecutionResult:
-    exit_code: int | None
-    error: str | None
-    startup_confirmed: bool
-    duration_seconds: float | None = None
-    user_seconds: float | None = None
-    system_seconds: float | None = None
-
-
-@dataclass(frozen=True)
-class TriageDecision:
-    action: str
-    summary: str
-    reason: str
-    failure_category: str
-    model: str
-    session_id: str
-    policy_hash: str
-
-
-@dataclass(frozen=True)
-class WorkerOutcome:
-    result: ExecutionResult
-    attempts: tuple[dict[str, object], ...]
-    triage: tuple[dict[str, object], ...]
-    monitor_error: str | None
-    duration_seconds: float
-    user_seconds: float | None
-    system_seconds: float | None
-
-
-@dataclass(frozen=True)
-class StateFailure:
-    request: WorkerRequest
-    outcome: WorkerOutcome
-    wake_id: str
-    error: str
-    goal_guard: dict[str, object]
 
 
 CompletionDelivery = Callable[[Path, str], None]
 StateFailureNotifier = Callable[[StateFailure], int]
-TriageCallback = Callable[[WorkerRequest, ExecutionResult, int], TriageDecision]
+TriageCallback = Callable[[WorkerRequest, ExecutionResult, int], TriageDecision | None]
+StageDelivery = Callable[[Path, str], None]
 
 
 def _error_text(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+def _record_runtime(request: WorkerRequest, state: str, **values: object) -> None:
+    if request.runtime_file is None:
+        return
+    write_run_runtime(
+        request.runtime_file,
+        run_id=request.run_id,
+        state=state,
+        **values,
+    )
 
 
 def _paused_lease_id(goal_guard: dict[str, object]) -> str | None:
@@ -151,6 +120,11 @@ def _start_process(
                 lease_id=lease_id,
                 target_pid=process.pid,
             )
+        _record_runtime(
+            request, "running", worker_pid=os.getpid(), target_pid=process.pid,
+            goal_guard=goal_guard, target_identity=optional_process_identity(process.pid),
+            observer_mode="owned",
+        )
     except Exception as error:
         if process is not None:
             return None, _cleanup_failure(process, error), False
@@ -178,6 +152,7 @@ def _execute(
     attempt_number: int,
     confirm_startup: bool,
     goal_guard: dict[str, object],
+    deliver_stage: StageDelivery | None,
 ) -> ExecutionResult:
     started_at = time.monotonic()
     before_cpu = cpu_usage_snapshot()
@@ -188,6 +163,7 @@ def _execute(
                     "utf-8", errors="replace"
                 )
             )
+            initial_log_offset = log.tell()
             with ProcessTreeSignalGuard() as signal_guard:
                 process, error, startup_confirmed = _start_process(
                     request,
@@ -207,13 +183,24 @@ def _execute(
                     )
                 assert process is not None
                 try:
-                    exit_code = process.wait()
+                    if request.stage_plan_file is not None and deliver_stage is None:
+                        raise RuntimeError("Stage delivery callback is required for a stage plan")
+                    exit_code, terminal_state, stage_error = supervise_owned_process(
+                        request,
+                        process,
+                        initial_log_offset=initial_log_offset,
+                        goal_guard=goal_guard,
+                        deliver_stage=deliver_stage or _unexpected_stage_delivery,
+                        wait_process=_wait_for_process,
+                    )
                     return _execution_result(
                         exit_code=exit_code,
                         error=None,
                         startup_confirmed=startup_confirmed,
                         started_at=started_at,
                         before_cpu=before_cpu,
+                        terminal_state=terminal_state,
+                        stage_delivery_error=stage_error,
                     )
                 except Exception as wait_error:
                     error = _cleanup_failure(process, wait_error)
@@ -242,6 +229,8 @@ def _execution_result(
     startup_confirmed: bool,
     started_at: float,
     before_cpu: tuple[float, float] | None,
+    terminal_state: str = "completed",
+    stage_delivery_error: str | None = None,
 ) -> ExecutionResult:
     metrics = collect_metrics(started_at, before_cpu)
     return ExecutionResult(
@@ -251,100 +240,17 @@ def _execution_result(
         duration_seconds=metrics.wall_seconds,
         user_seconds=metrics.user_seconds,
         system_seconds=metrics.system_seconds,
+        terminal_state=terminal_state,
+        stage_delivery_error=stage_delivery_error,
     )
 
 
-def _attempt_record(number: int, result: ExecutionResult) -> dict[str, object]:
-    return {
-        "attempt": number,
-        "exit_code": result.exit_code,
-        "error": result.error,
-        "duration_seconds": result.duration_seconds,
-        "user_seconds": result.user_seconds,
-        "system_seconds": result.system_seconds,
-    }
+def _unexpected_stage_delivery(_path: Path, _codex_bin: str) -> None:
+    raise RuntimeError("Stage delivery callback is unavailable")
 
 
-def _decision_record(attempt: int, decision: TriageDecision) -> dict[str, object]:
-    return {
-        "attempt": attempt,
-        "action": decision.action,
-        "summary": decision.summary,
-        "reason": decision.reason,
-        "failure_category": decision.failure_category,
-        "model": decision.model,
-        "session_id": decision.session_id,
-        "policy_hash": decision.policy_hash,
-    }
-
-
-def _execute_attempts(
-    request: WorkerRequest,
-    triage: TriageCallback | None,
-    goal_guard: dict[str, object],
-) -> WorkerOutcome:
-    attempts: list[dict[str, object]] = []
-    decisions: list[dict[str, object]] = []
-    retry_count = 0
-    duration_seconds = 0.0
-    user_seconds: float | None = 0.0
-    system_seconds: float | None = 0.0
-    while True:
-        attempt_number = retry_count + 1
-        result = _execute(
-            request,
-            attempt_number=attempt_number,
-            confirm_startup=attempt_number == 1 and request.startup_file is not None,
-            goal_guard=goal_guard,
-        )
-        attempts.append(_attempt_record(attempt_number, result))
-        if result.duration_seconds is not None:
-            duration_seconds += result.duration_seconds
-        user_seconds = _accumulate_metric(user_seconds, result.user_seconds)
-        system_seconds = _accumulate_metric(system_seconds, result.system_seconds)
-        if not result.startup_confirmed or triage is None:
-            return WorkerOutcome(
-                result=result,
-                attempts=tuple(attempts),
-                triage=tuple(decisions),
-                monitor_error=None,
-                duration_seconds=duration_seconds,
-                user_seconds=user_seconds,
-                system_seconds=system_seconds,
-            )
-        try:
-            decision = triage(request, result, retry_count)
-            decisions.append(_decision_record(attempt_number, decision))
-            if decision.action == TRIAGE_RETRY_EXACT:
-                retry_count += 1
-                continue
-            if decision.action not in TRIAGE_TERMINAL_ACTIONS:
-                raise RuntimeError(f"Unknown monitor decision: {decision.action}")
-            return WorkerOutcome(
-                result=result,
-                attempts=tuple(attempts),
-                triage=tuple(decisions),
-                monitor_error=None,
-                duration_seconds=duration_seconds,
-                user_seconds=user_seconds,
-                system_seconds=system_seconds,
-            )
-        except Exception as error:
-            return WorkerOutcome(
-                result=result,
-                attempts=tuple(attempts),
-                triage=tuple(decisions),
-                monitor_error=_error_text(error),
-                duration_seconds=duration_seconds,
-                user_seconds=user_seconds,
-                system_seconds=system_seconds,
-            )
-
-
-def _accumulate_metric(total: float | None, value: float | None) -> float | None:
-    if total is None or value is None:
-        return None
-    return total + value
+def _wait_for_process(process: subprocess.Popen[bytes]) -> int:
+    return process.wait()
 
 
 def _report_startup_failure(
@@ -366,6 +272,7 @@ def _report_startup_failure(
         except Exception as error:
             cancellation_failed = True
             detail = f"{detail}; Goal guard cancellation failed: {_error_text(error)}"
+    _record_runtime(request, "startup_failed", worker_pid=os.getpid(), error=detail)
     write_startup_status(
         request.startup_file,
         state="startup_failed",
@@ -396,8 +303,10 @@ def _persist_completion(
         execution_attempts=list(outcome.attempts),
         monitor_plan_file=str(request.monitor_plan_file) if request.monitor_plan_file else None,
         monitor_triage=list(outcome.triage),
+        monitor_status=outcome.monitor_status,
         monitor_error=outcome.monitor_error,
         goal_guard=goal_guard,
+        terminal_state=outcome.result.terminal_state,
     )
 
 
@@ -408,6 +317,7 @@ def _await_commit_gate(request: WorkerRequest) -> dict[str, object]:
         raise RuntimeError("worker startup_file and gate_file must be provided together")
     if request.launcher_pid is None or request.launcher_pid <= 0:
         raise RuntimeError("two-phase worker requires a valid launcher_pid")
+    _record_runtime(request, "prepared", worker_pid=os.getpid())
     write_startup_status(
         request.startup_file,
         state="prepared",
@@ -439,6 +349,7 @@ def _report_gate_failure(request: WorkerRequest, error: Exception) -> int:
         cancel_error = caught
         detail = f"{detail}; Goal guard cancellation failed: {_error_text(caught)}"
     assert request.startup_file is not None
+    _record_runtime(request, "startup_failed", worker_pid=os.getpid(), error=detail)
     write_startup_status(
         request.startup_file,
         state="startup_failed",
@@ -457,15 +368,20 @@ def run_worker(
     deliver: CompletionDelivery,
     notify_state_failure: StateFailureNotifier,
     triage: TriageCallback | None = None,
+    deliver_stage: StageDelivery | None = None,
 ) -> int:
     try:
         goal_guard = _await_commit_gate(request)
     except Exception as error:
         return _report_gate_failure(request, error)
-    outcome = _execute_attempts(request, triage, goal_guard)
+    outcome = execute_attempts(
+        request, triage, goal_guard, deliver_stage, execute=_execute
+    )
     result = outcome.result
     if not result.startup_confirmed:
         return _report_startup_failure(request, result, goal_guard)
+    if result.terminal_state == "detached":
+        return 0
     wake_id = uuid.uuid4().hex
     try:
         completion_file = _persist_completion(request, outcome, wake_id, goal_guard)
@@ -480,6 +396,21 @@ def run_worker(
             error=state_error,
             goal_guard=goal_guard,
         ))
+    runtime_error: str | None = None
+    if request.runtime_file is not None:
+        try:
+            _record_runtime(
+                request,
+                result.terminal_state,
+                worker_pid=os.getpid(),
+                exit_code=result.exit_code,
+                error=result.error or outcome.monitor_error,
+                completion_file=completion_file,
+            )
+        except Exception as error:
+            runtime_error = _error_text(error)
+            with open_private_log(request.log_file) as log:
+                log.write(f"\n[wake-run] runtime state update failed: {runtime_error}\n".encode("utf-8"))
     try:
         deliver(completion_file, request.codex_bin)
     except Exception as error:
@@ -488,6 +419,10 @@ def run_worker(
         return WORKER_DELIVERY_FAILURE
     if result.error is not None:
         return WORKER_STARTUP_FAILURE
+    if result.stage_delivery_error is not None:
+        return WORKER_DELIVERY_FAILURE
     if outcome.monitor_error is not None:
         return WORKER_MONITOR_FAILURE
+    if runtime_error is not None:
+        return WORKER_STATE_FAILURE
     return result.exit_code if result.exit_code is not None else 1

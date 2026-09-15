@@ -5,10 +5,86 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
+from pathlib import Path
 from types import FrameType
 
 PROCESS_TREE_STOP_TIMEOUT = 5
 WINDOWS_FORCE_KILL_FLAGS = ("/T", "/F")
+LINUX_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+
+
+def process_identity(pid: int, *, platform: str | None = None) -> dict[str, object]:
+    active_platform = platform or os.name
+    if active_platform != "posix" or not Path("/proc").is_dir():
+        raise RuntimeError("Process identity capture for adopt is supported only on Linux")
+    _state, start_time = _linux_process_state_and_start(pid)
+    return {
+        "platform": "linux",
+        "pid": pid,
+        "boot_id": LINUX_BOOT_ID.read_text(encoding="utf-8").strip(),
+        "start_time_ticks": start_time,
+    }
+
+
+def optional_process_identity(pid: int) -> dict[str, object] | None:
+    if os.name != "posix" or not Path("/proc").is_dir():
+        return None
+    try:
+        return process_identity(pid)
+    except FileNotFoundError:
+        return None
+
+
+def process_identity_matches(identity: dict[str, object]) -> bool:
+    pid = identity.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise RuntimeError("Persisted target identity has no valid pid")
+    if identity.get("platform") != "linux":
+        raise RuntimeError("Persisted target identity is not a Linux identity")
+    try:
+        state, start_time = _linux_process_state_and_start(pid)
+        boot_id = LINUX_BOOT_ID.read_text(encoding="utf-8").strip()
+        return (
+            state != "Z"
+            and identity.get("boot_id") == boot_id
+            and identity.get("start_time_ticks") == start_time
+        )
+    except FileNotFoundError:
+        return False
+
+
+def _linux_process_state_and_start(pid: int) -> tuple[str, int]:
+    stat_path = Path("/proc") / str(pid) / "stat"
+    stat_text = stat_path.read_text(encoding="utf-8")
+    _prefix, separator, suffix = stat_text.rpartition(") ")
+    fields = suffix.split()
+    if not separator or len(fields) <= 19:
+        raise RuntimeError(f"Cannot parse Linux process identity from {stat_path}")
+    return fields[0], int(fields[19])
+
+
+def terminate_identified_process_tree(
+    identity: dict[str, object],
+    *,
+    timeout: float = PROCESS_TREE_STOP_TIMEOUT,
+) -> None:
+    if not process_identity_matches(identity):
+        return
+    pid = int(identity["pid"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + timeout
+    while process_identity_matches(identity):
+        if time.monotonic() >= deadline:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return
+        time.sleep(0.05)
 
 
 def target_popen_kwargs(*, platform: str | None = None) -> dict[str, object]:

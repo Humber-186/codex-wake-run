@@ -1,6 +1,6 @@
 <h1 align="center">wake-run-skill</h1>
 
-<p align="center">A Codex Skill that runs long commands in a detached watcher and wakes the originating Codex thread when the process exits, so the model never polls for status.</p>
+<p align="center">A Codex Skill that runs long commands in detached watchers and wakes the originating thread at declared log milestones and process termination, without model polling.</p>
 
 <p align="center">
   <a href="./README.md">English</a> | <a href="./README.zh-CN.md">简体中文</a>
@@ -18,13 +18,16 @@ wake-run removes the wait. You hand it the finalized command; it spawns a detach
 
 | Highlight | Why it matters |
 |---|---|
-| Event-driven long jobs | The watcher blocks on `process.wait()`; only the bounded startup handshake checks a status file. |
+| Event-driven long jobs | A waiter thread blocks on `process.wait()` while a lightweight supervisor handles log increments and explicit controls. |
+| Ordered stage wakes | One EDA process can wake once after DC, placement, CTS, and routing, then emit one final terminal event. |
+| Explicit lifecycle | `stop` terminates the process tree, `detach` leaves it running, and `adopt` recovers observation of a lost-worker Linux run. |
 | Strict startup confirmation | `armed` is returned only after the worker reports the monitored shell PID. Startup failure and timeout are explicit errors. |
 | Active Goal protection | A durable, shared lease pauses and verifies an active Goal before target startup; wake delivery succeeds before conditional restoration. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job. |
 | Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
 | Explicit stable baseline | Reliability targets a few trusted users on Linux with Codex CLI 0.154.0+; Windows paths remain, but are outside the current stability claim. |
 | Durable delivery state | Each run has a log and atomic completion JSON recording delivery attempts, errors, and final state. |
+| Discoverable background runs | Every run persists spec/runtime state plus a lightweight global index for thread-scoped listing and `run_id` lookup. |
 | Optional economical monitoring | A separate lower-cost Codex session performs event-time triage; the main agent explicitly fixes the model, evidence budget, and exact-retry authorization. |
 | Structural recursion prevention | Monitor-role processes cannot launch or replay wake-run; retries stay inside the existing worker and never create nested watchers. |
 
@@ -41,13 +44,13 @@ wake_run.py launcher
     ▼
 experiment process
     │
-    │ process.wait()
+    │ process.wait() + ordered log milestones
     ▼
 exit code + log
     │
     ├─ direct mode: durable completion event
     │
-    └─ economical mode: resume read-only monitor session
+    └─ economical mode: create or resume read-only monitor session as selected
             ├─ authorized retry_exact ──► run exact command again
             └─ success / escalation / monitor error
     │
@@ -90,6 +93,50 @@ wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
 
 After receiving `armed`, Codex sends one concise confirmation and ends the current turn. It reads the referenced log only after the wake-up arrives, then continues the original task.
 
+No autonomous polling does not prevent an explicit status query. When the user asks, make one deterministic query:
+
+```bash
+python <skill-dir>/scripts/wake_run.py --list --active
+python <skill-dir>/scripts/wake_run.py --show <run_id>
+```
+
+Use `--name route-opt` at launch for a readable label. `--list` is scoped to runs started by the current Codex thread. The global index lives under `${CODEX_HOME:-~/.codex}/wake-run/index/`; full spec/runtime state stays beside the selected run log.
+
+### Multi-stage EDA runs
+
+A stage plan contains static, ordered, one-shot line regular expressions:
+
+```json
+{
+  "schema_version": 1,
+  "stages": [
+    {"id": "dc", "pattern": "Design Compiler completed"},
+    {"id": "place", "pattern": "place_opt completed"},
+    {"id": "cts", "pattern": "clock_opt completed"},
+    {"id": "route", "pattern": "route_opt completed"}
+  ]
+}
+```
+
+```bash
+python3 <skill-dir>/scripts/wake_run.py \
+  --command './run_flow.sh' \
+  --name full-chip-flow \
+  --stage-plan /absolute/path/stages.json
+```
+
+Only complete log lines are matched, and only the next unfinished stage is eligible. Each stage event is persisted before delivery with a stable `wake_id`; it does not release the Goal. Process termination still creates the final event. This first version intentionally excludes arbitrary script predicates, continuous model judgment, elapsed timers, and idle guesses.
+
+### Lifecycle control and recovery
+
+```bash
+python <skill-dir>/scripts/wake_run.py --stop <run_id>
+python <skill-dir>/scripts/wake_run.py --detach <run_id>
+python <skill-dir>/scripts/wake_run.py --adopt <run_id>
+```
+
+`stop` terminates the target process tree with TERM/KILL and emits a `cancelled` terminal wake. `detach` releases this Run's Goal holder before the worker exits; the target keeps running, with no promised exit status or final notification. `adopt` is only for a dead original worker with a still-live target. It rejects PID reuse by checking Linux boot ID and `/proc/<pid>/stat` starttime, then resumes unfinished stage observation. Because the new observer is not the target's parent, its final message explicitly reports `observer_mode: adopted` and `exact_exit_code_available: false`. A healthy run cannot be adopted.
+
 `wall` is elapsed wall-clock time. `user` and `sys` are user-mode and kernel-mode CPU time. On Windows, process-tree CPU accounting is unavailable, so `user` and `sys` are omitted instead of presenting the PowerShell host's incomplete CPU time.
 
 Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate messages represent the same completion event and must not repeat completed follow-up work. Before each delivery attempt, `<run_id>.completion.json` records `pending`, `delivering`, or `delivered` plus attempt details. Undelivered events can be retried explicitly:
@@ -108,9 +155,10 @@ Economical monitoring is not model polling. The operating-system watcher still w
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model": "gpt-5.6-luna",
-  "instructions": "Summarize success. Retry only a clear transient external service failure; escalate every other failure.",
+  "review_on": ["failure"],
+  "instructions": "Retry only a clear transient external service failure; escalate every other failure.",
   "allowed_actions": ["retry_exact"],
   "max_exact_retries": 1,
   "log_tail_bytes": 65536
@@ -125,11 +173,11 @@ python3 <skill-dir>/scripts/wake_run.py \
   --monitor-plan '<absolute path to plan JSON>'
 ```
 
-Before starting the target, the launcher creates and confirms a separate read-only Codex session. Every resume explicitly reapplies the read-only sandbox, fixed state-directory cwd, and non-Git-directory allowance. Failure is explicit: it never falls back to direct mode or substitutes another model. The monitor must return `report_success`, `retry_exact`, or `escalate`. The worker validates run identity, the plan hash, exit state, failure classification, and remaining authorization; the model cannot supply a modified command, and launch or wait errors cannot be retried automatically. Monitor invocation or protocol failure is persisted in the completion event and wakes the main thread.
+Before starting the target, the launcher preflights `codex exec` and `exec resume` and persists the monitor policy, but it makes no readiness-only model call. With `review_on: ["failure"]`, a successful task makes zero Luna calls. The first selected result lazily creates a read-only session and performs triage directly; later retries resume it. Every call applies the fixed model, read-only sandbox, state-directory cwd, and non-Git allowance. Invocation or protocol failure is persisted and delivered without falling back or substituting a model. Wake messages include the real action, category, summary, and reason.
 
 Authorize `retry_exact` only when repeating the complete command is safe even if the prior attempt produced partial side effects. A transient external failure does not prove that no side effect occurred; deployment, publishing, payment, and database-migration commands should normally disallow automatic retries.
 
-This mode currently watches process-exit events only; it does not claim to detect a hung process. See [`references/economic-monitor.md`](./references/economic-monitor.md) for the complete plan and decision contract.
+Economical monitoring reviews execution termination only. Stage events use deterministic log matching without Luna and do not claim to detect a hung process. See [`references/economic-monitor.md`](./references/economic-monitor.md) for the complete plan and decision contract.
 
 ## Quick Start
 
@@ -167,8 +215,14 @@ A few things worth knowing:
 | [`scripts/wake_run_app_server.py`](./scripts/wake_run_app_server.py) | Bounded JSONL client for stable Codex App Server RPC. |
 | [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Shared Goal leases, verification, conflict handling, and recovery. |
 | [`scripts/wake_run_goal_state.py`](./scripts/wake_run_goal_state.py) | Goal lease schema and holder phases. |
+| [`scripts/wake_run_stages.py`](./scripts/wake_run_stages.py) | Stage-plan validation and incremental log matching. |
+| [`scripts/wake_run_supervisor.py`](./scripts/wake_run_supervisor.py) | Runtime stage scanning, delivery queue, and controls. |
+| [`scripts/wake_run_control.py`](./scripts/wake_run_control.py) | `stop` / `detach` commands and acknowledgements. |
+| [`scripts/wake_run_adopt.py`](./scripts/wake_run_adopt.py) | Validation and launch for Linux recovery observers. |
 | [`scripts/wake_run_launcher.py`](./scripts/wake_run_launcher.py) | Two-phase supervisor and target startup. |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
+| [`scripts/wake_run_registry.py`](./scripts/wake_run_registry.py) | Run spec/runtime, the global index, and list/show queries. |
+| [`scripts/wake_run_models.py`](./scripts/wake_run_models.py) | Immutable records shared by the worker and monitor. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
 | [`scripts/wake_run_metrics.py`](./scripts/wake_run_metrics.py) | Wall-clock and CPU timing metrics. |
 | [`scripts/wake_run_process.py`](./scripts/wake_run_process.py) | Cross-platform target process groups and failure cleanup. |
@@ -180,6 +234,7 @@ A few things worth knowing:
 | [`tests/test_monitor.py`](./tests/test_monitor.py) | Economical-monitor plans, protocol, authorized retries, and end-to-end tests. |
 | [`tests/test_process.py`](./tests/test_process.py) | POSIX and Windows process-tree cleanup tests. |
 | [`tests/test_goal_worker.py`](./tests/test_goal_worker.py) | Goal spawn-window, orphan, and blocking-lock tests. |
+| [`tests/test_lifecycle.py`](./tests/test_lifecycle.py) | Multi-stage, stop, detach, adopt, and replay integration tests. |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | Economical-monitor plan and decision contract. |
 
 Run logs default to `.codex-wake-run/` in the project you launch from. This repository ignores that directory, but a host project does not inherit this repository's `.gitignore`; add `.codex-wake-run/` to the host project yourself. For large EDA projects, `--log-dir ~/.codex/wake-run/<project>` keeps frequently updated state off the source tree or NFS storage.
