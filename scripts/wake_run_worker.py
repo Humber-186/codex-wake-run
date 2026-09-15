@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
 
+from wake_run_metrics import collect_metrics, cpu_usage_snapshot
 from wake_run_platform import build_experiment_invocation
 from wake_run_process import ProcessTreeSignalGuard, target_popen_kwargs, terminate_process_tree
 from wake_run_state import create_completion_event, open_private_log, write_startup_status
@@ -38,14 +40,9 @@ class ExecutionResult:
     exit_code: int | None
     error: str | None
     startup_confirmed: bool
-
-
-@dataclass(frozen=True)
-class StateFailure:
-    request: WorkerRequest
-    result: ExecutionResult
-    wake_id: str
-    error: str
+    duration_seconds: float | None = None
+    user_seconds: float | None = None
+    system_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +62,17 @@ class WorkerOutcome:
     attempts: tuple[dict[str, object], ...]
     triage: tuple[dict[str, object], ...]
     monitor_error: str | None
+    duration_seconds: float
+    user_seconds: float | None
+    system_seconds: float | None
+
+
+@dataclass(frozen=True)
+class StateFailure:
+    request: WorkerRequest
+    outcome: WorkerOutcome
+    wake_id: str
+    error: str
 
 
 CompletionDelivery = Callable[[Path, str], None]
@@ -127,6 +135,8 @@ def _execute(
     attempt_number: int,
     confirm_startup: bool,
 ) -> ExecutionResult:
+    started_at = time.monotonic()
+    before_cpu = cpu_usage_snapshot()
     try:
         with open_private_log(request.log_file) as log:
             log.write(
@@ -143,16 +153,60 @@ def _execute(
                 )
                 if error is not None:
                     log.write(f"\n[wake-run] execution failed: {error}\n".encode("utf-8"))
-                    return ExecutionResult(None, error, startup_confirmed)
+                    return _execution_result(
+                        exit_code=None,
+                        error=error,
+                        startup_confirmed=startup_confirmed,
+                        started_at=started_at,
+                        before_cpu=before_cpu,
+                    )
                 assert process is not None
                 try:
-                    return ExecutionResult(process.wait(), None, startup_confirmed)
+                    exit_code = process.wait()
+                    return _execution_result(
+                        exit_code=exit_code,
+                        error=None,
+                        startup_confirmed=startup_confirmed,
+                        started_at=started_at,
+                        before_cpu=before_cpu,
+                    )
                 except Exception as wait_error:
                     error = _cleanup_failure(process, wait_error)
                     log.write(f"\n[wake-run] process wait failed: {error}\n".encode("utf-8"))
-                    return ExecutionResult(None, error, startup_confirmed)
+                    return _execution_result(
+                        exit_code=None,
+                        error=error,
+                        startup_confirmed=startup_confirmed,
+                        started_at=started_at,
+                        before_cpu=before_cpu,
+                    )
     except Exception as error:
-        return ExecutionResult(None, _error_text(error), not confirm_startup)
+        return _execution_result(
+            exit_code=None,
+            error=_error_text(error),
+            startup_confirmed=not confirm_startup,
+            started_at=started_at,
+            before_cpu=before_cpu,
+        )
+
+
+def _execution_result(
+    *,
+    exit_code: int | None,
+    error: str | None,
+    startup_confirmed: bool,
+    started_at: float,
+    before_cpu: tuple[float, float] | None,
+) -> ExecutionResult:
+    metrics = collect_metrics(started_at, before_cpu)
+    return ExecutionResult(
+        exit_code=exit_code,
+        error=error,
+        startup_confirmed=startup_confirmed,
+        duration_seconds=metrics.wall_seconds,
+        user_seconds=metrics.user_seconds,
+        system_seconds=metrics.system_seconds,
+    )
 
 
 def _attempt_record(number: int, result: ExecutionResult) -> dict[str, object]:
@@ -160,6 +214,9 @@ def _attempt_record(number: int, result: ExecutionResult) -> dict[str, object]:
         "attempt": number,
         "exit_code": result.exit_code,
         "error": result.error,
+        "duration_seconds": result.duration_seconds,
+        "user_seconds": result.user_seconds,
+        "system_seconds": result.system_seconds,
     }
 
 
@@ -183,6 +240,9 @@ def _execute_attempts(
     attempts: list[dict[str, object]] = []
     decisions: list[dict[str, object]] = []
     retry_count = 0
+    duration_seconds = 0.0
+    user_seconds: float | None = 0.0
+    system_seconds: float | None = 0.0
     while True:
         attempt_number = retry_count + 1
         result = _execute(
@@ -191,8 +251,20 @@ def _execute_attempts(
             confirm_startup=attempt_number == 1 and request.startup_file is not None,
         )
         attempts.append(_attempt_record(attempt_number, result))
+        if result.duration_seconds is not None:
+            duration_seconds += result.duration_seconds
+        user_seconds = _accumulate_metric(user_seconds, result.user_seconds)
+        system_seconds = _accumulate_metric(system_seconds, result.system_seconds)
         if not result.startup_confirmed or triage is None:
-            return WorkerOutcome(result, tuple(attempts), tuple(decisions), None)
+            return WorkerOutcome(
+                result=result,
+                attempts=tuple(attempts),
+                triage=tuple(decisions),
+                monitor_error=None,
+                duration_seconds=duration_seconds,
+                user_seconds=user_seconds,
+                system_seconds=system_seconds,
+            )
         try:
             decision = triage(request, result, retry_count)
             decisions.append(_decision_record(attempt_number, decision))
@@ -201,9 +273,31 @@ def _execute_attempts(
                 continue
             if decision.action not in TRIAGE_TERMINAL_ACTIONS:
                 raise RuntimeError(f"Unknown monitor decision: {decision.action}")
-            return WorkerOutcome(result, tuple(attempts), tuple(decisions), None)
+            return WorkerOutcome(
+                result=result,
+                attempts=tuple(attempts),
+                triage=tuple(decisions),
+                monitor_error=None,
+                duration_seconds=duration_seconds,
+                user_seconds=user_seconds,
+                system_seconds=system_seconds,
+            )
         except Exception as error:
-            return WorkerOutcome(result, tuple(attempts), tuple(decisions), _error_text(error))
+            return WorkerOutcome(
+                result=result,
+                attempts=tuple(attempts),
+                triage=tuple(decisions),
+                monitor_error=_error_text(error),
+                duration_seconds=duration_seconds,
+                user_seconds=user_seconds,
+                system_seconds=system_seconds,
+            )
+
+
+def _accumulate_metric(total: float | None, value: float | None) -> float | None:
+    if total is None or value is None:
+        return None
+    return total + value
 
 
 def _report_startup_failure(request: WorkerRequest, result: ExecutionResult) -> int:
@@ -231,6 +325,9 @@ def _persist_completion(
         command=request.command,
         exit_code=outcome.result.exit_code,
         launch_error=outcome.result.error,
+        duration_seconds=outcome.duration_seconds,
+        user_seconds=outcome.user_seconds,
+        system_seconds=outcome.system_seconds,
         wake_id=wake_id,
         execution_attempts=list(outcome.attempts),
         monitor_plan_file=str(request.monitor_plan_file) if request.monitor_plan_file else None,
@@ -257,7 +354,12 @@ def run_worker(
         state_error = _error_text(error)
         with open_private_log(request.log_file) as log:
             log.write(f"\n[wake-run] completion persistence failed: {state_error}\n".encode("utf-8"))
-        return notify_state_failure(StateFailure(request, result, wake_id, state_error))
+        return notify_state_failure(StateFailure(
+            request=request,
+            outcome=outcome,
+            wake_id=wake_id,
+            error=state_error,
+        ))
     try:
         deliver(completion_file, request.codex_bin)
     except Exception as error:

@@ -318,6 +318,44 @@ class MonitorWorkerTests(unittest.TestCase):
         self.assertEqual(result, worker.WORKER_MONITOR_FAILURE)
         self.assertIn("monitor unavailable", event["monitor"]["error"])
 
+    def test_state_failure_notification_uses_cumulative_retry_metrics(self) -> None:
+        execution_results = iter([
+            worker.ExecutionResult(
+                exit_code=9, error=None, startup_confirmed=True,
+                duration_seconds=10.0, user_seconds=2.0, system_seconds=1.0,
+            ),
+            worker.ExecutionResult(
+                exit_code=0, error=None, startup_confirmed=True,
+                duration_seconds=20.0, user_seconds=4.0, system_seconds=2.0,
+            ),
+        ])
+        decisions = iter([self.decision("retry_exact"), self.decision("report_success")])
+        messages: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            request = worker.WorkerRequest(
+                "thread", "command", directory, directory / "run.log",
+                "codex", "run1", None, directory / "run.monitor.json",
+            )
+            with (
+                mock.patch.object(worker, "_execute", side_effect=execution_results),
+                mock.patch.object(
+                    worker, "create_completion_event", side_effect=OSError("disk full")
+                ),
+                mock.patch.object(
+                    wake_run, "queue_wakeup",
+                    side_effect=lambda _thread, message, _codex: messages.append(message) or 1,
+                ),
+            ):
+                result = worker.run_worker(
+                    request,
+                    deliver=lambda *_args: None,
+                    notify_state_failure=wake_run._notify_state_failure,
+                    triage=lambda *_args: next(decisions),
+                )
+        self.assertEqual(result, worker.WORKER_STATE_FAILURE)
+        self.assertIn("wall：30.000s\nuser：6.000s\nsys：3.000s", messages[0])
+
 
 class MonitorIntegrationTests(unittest.TestCase):
     def create_fake_codex(self, directory: Path) -> Path:
@@ -384,6 +422,7 @@ raise SystemExit(2)
         wake_message = queued[queued.index("--message") + 1]
         self.assertTrue(wake_message.startswith("[后台任务完成-系统提示]"))
         self.assertIn("exit_code: 0", wake_message)
+        self.assertRegex(wake_message, r"wall：\d+\.\d{3}s\nuser：\d+\.\d{3}s\nsys：\d+\.\d{3}s")
 
     @mock.patch.object(wake_run.subprocess, "Popen")
     @mock.patch.object(wake_run, "create_monitor_session", side_effect=RuntimeError("monitor denied"))

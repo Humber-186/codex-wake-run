@@ -87,17 +87,36 @@ def build_wake_message(
     exit_code: int | None,
     log_file: Path,
     *,
+    duration_seconds: float | None = None,
+    user_seconds: float | None = None,
+    system_seconds: float | None = None,
     run_id: str = "",
     wake_id: str = "",
 ) -> str:
-    return "\n".join([
+    lines = [
         WAKE_HEADER,
         f"任务：{command}",
         f"日志：{log_file}",
         f"exit_code: {exit_code}",
+    ]
+    lines.extend(
+        f"{label}：{_format_duration(value)}"
+        for label, value in (
+            ("wall", duration_seconds),
+            ("user", user_seconds),
+            ("sys", system_seconds),
+        )
+        if value is not None
+    )
+    lines.extend([
         f"run_id：{run_id}",
         f"wake_id：{wake_id}",
     ])
+    return "\n".join(lines)
+
+
+def _format_duration(duration_seconds: float) -> str:
+    return f"{duration_seconds:.3f}s"
 
 
 def preflight_codex_queue(codex_bin: str) -> str:
@@ -187,6 +206,21 @@ def _event_message(event: dict[str, object]) -> str:
         str(event["command"]),
         event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
         Path(str(event["log_file"])),
+        duration_seconds=(
+            float(event["duration_seconds"])
+            if isinstance(event.get("duration_seconds"), (int, float))
+            else None
+        ),
+        user_seconds=(
+            float(event["user_seconds"])
+            if isinstance(event.get("user_seconds"), (int, float))
+            else None
+        ),
+        system_seconds=(
+            float(event["system_seconds"])
+            if isinstance(event.get("system_seconds"), (int, float))
+            else None
+        ),
         run_id=str(event["run_id"]),
         wake_id=str(event["wake_id"]),
     )
@@ -237,10 +271,14 @@ def deliver_completion(completion_file: Path, codex_bin: str) -> None:
 
 def _notify_state_failure(failure: StateFailure) -> int:
     request = failure.request
+    outcome = failure.outcome
     message = build_wake_message(
         request.command,
-        failure.result.exit_code,
+        outcome.result.exit_code,
         request.log_file,
+        duration_seconds=outcome.duration_seconds,
+        user_seconds=outcome.user_seconds,
+        system_seconds=outcome.system_seconds,
         run_id=request.run_id,
         wake_id=failure.wake_id,
     )

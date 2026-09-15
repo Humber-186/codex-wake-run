@@ -64,8 +64,13 @@ The watcher injects this shape after process exit:
 任务：{command}
 日志：{log_file}
 exit_code: {exit_code}
+wall：{wall_time}
+user：{user_time}
+sys：{system_time}
 run_id：{run_id}
 wake_id：{wake_id}
 ```
 
 The long-running watcher is event-driven and uses process `wait()`. The launcher performs only a bounded startup handshake before returning `armed`; it never polls the long-running task.
+
+`wall` is elapsed wall-clock time; `user` and `sys` are CPU times. Unavailable metrics are omitted. Windows omits `user` and `sys` because the current process model cannot reliably account for the complete PowerShell child-process tree.

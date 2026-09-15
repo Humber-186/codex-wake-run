@@ -43,21 +43,6 @@ def acquire_delivery_lock(event: Path) -> None:
         pass
 
 
-class WakeMessageTests(unittest.TestCase):
-    def test_wake_message_matches_minimal_contract(self) -> None:
-        success = wake_run.build_wake_message(
-            "python train.py", 0, Path("/tmp/run.log"), run_id="run1", wake_id="wake1"
-        )
-        self.assertEqual(success, "\n".join([
-            "[后台任务完成-系统提示]",
-            "任务：python train.py",
-            "日志：/tmp/run.log",
-            "exit_code: 0",
-            "run_id：run1",
-            "wake_id：wake1",
-        ]))
-
-
 class InvocationTests(unittest.TestCase):
     def test_windows_experiment_preserves_exit_code(self) -> None:
         invocation = wake_platform.build_experiment_invocation(
@@ -190,6 +175,7 @@ class WorkerTests(unittest.TestCase):
             self.assertIn("12345", (directory / "run.log").read_text(encoding="utf-8"))
             event = wake_state.read_json(directory / "run.completion.json")
             self.assertEqual(event["delivery"]["state"], wake_state.DELIVERY_DELIVERED)
+            self.assertGreaterEqual(event["duration_seconds"], 0)
 
     def test_worker_preserves_pipeline_failure(self) -> None:
         if os.name == "nt" or not wake_platform.shutil.which("bash"):

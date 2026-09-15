@@ -80,11 +80,16 @@ When the script exits, the watcher queues a wake-up into that same thread:
 任务：echo "training started"; sleep 2; echo "done"
 日志：/work/project/.codex-wake-run/b7599ab35869.log
 exit_code: 0
+wall：2.003s
+user：0.012s
+sys：0.004s
 run_id：b7599ab35869
 wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
 ```
 
 After receiving `armed`, Codex sends one concise confirmation and ends the current turn. It reads the referenced log only after the wake-up arrives, then continues the original task.
+
+`wall` is elapsed wall-clock time. `user` and `sys` are user-mode and kernel-mode CPU time. On Windows, process-tree CPU accounting is unavailable, so `user` and `sys` are omitted instead of presenting the PowerShell host's incomplete CPU time.
 
 Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate messages represent the same completion event and must not repeat completed follow-up work. Before each delivery attempt, `<run_id>.completion.json` records `pending`, `delivering`, or `delivered` plus attempt details. Undelivered events can be retried explicitly:
 
@@ -154,6 +159,7 @@ A few things worth knowing:
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Startup handshake, wake delivery, and replay. |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
+| [`scripts/wake_run_metrics.py`](./scripts/wake_run_metrics.py) | Wall-clock and CPU timing metrics. |
 | [`scripts/wake_run_process.py`](./scripts/wake_run_process.py) | Cross-platform target process groups and failure cleanup. |
 | [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | Atomic state persistence, permissions, and delivery locking. |
 | [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows and POSIX command construction. |

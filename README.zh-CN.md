@@ -80,11 +80,16 @@ Codex 被唤醒并继续原任务
 任务：echo "training started"; sleep 2; echo "done"
 日志：/work/project/.codex-wake-run/b7599ab35869.log
 exit_code: 0
+wall：2.003s
+user：0.012s
+sys：0.004s
 run_id：b7599ab35869
 wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
 ```
 
 Codex 在收到 `armed` 后只发送一条简短确认并结束当前轮次；收到唤醒后再根据需要读取日志并继续原任务。
+
+`wall` 是墙钟耗时；`user` 和 `sys` 分别是用户态与内核态 CPU 耗时。Windows 下无法可靠统计整棵进程树的 CPU 时间，因此省略 `user` 和 `sys`，不会使用 PowerShell 宿主进程的不完整数据。
 
 唤醒采用 at-least-once（至少一次）投递语义。重试始终复用同一个 `wake_id`，因此重复消息代表同一个完成事件，不应重复执行已经完成的后续动作。每次投递前，`<run_id>.completion.json` 会记录 `pending`、`delivering` 或 `delivered` 状态以及尝试详情。未送达事件可以显式补发：
 
@@ -154,6 +159,7 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | 启动握手、唤醒投递与补发。 |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | 监护计划、Codex 会话、结构化分诊与递归防护。 |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | 目标进程执行与完成事件持久化。 |
+| [`scripts/wake_run_metrics.py`](./scripts/wake_run_metrics.py) | 墙钟与 CPU 耗时统计。 |
 | [`scripts/wake_run_process.py`](./scripts/wake_run_process.py) | 跨平台目标进程组与失败清理。 |
 | [`scripts/wake_run_state.py`](./scripts/wake_run_state.py) | 原子状态持久化、文件权限与投递锁。 |
 | [`scripts/wake_run_platform.py`](./scripts/wake_run_platform.py) | Windows 与 POSIX 命令构造。 |
