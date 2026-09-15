@@ -44,17 +44,18 @@ def acquire_delivery_lock(event: Path) -> None:
 
 
 class WakeMessageTests(unittest.TestCase):
-    def test_success_and_failure_messages(self) -> None:
+    def test_wake_message_matches_minimal_contract(self) -> None:
         success = wake_run.build_wake_message(
             "python train.py", 0, Path("/tmp/run.log"), run_id="run1", wake_id="wake1"
         )
-        failure = wake_run.build_wake_message("python train.py", 7, Path("/tmp/run.log"))
-        self.assertTrue(success.startswith("[后台任务唤醒通知]"))
-        self.assertIn("状态：执行完成", success)
-        self.assertIn("run_id：run1", success)
-        self.assertIn("wake_id：wake1", success)
-        self.assertIn("状态：执行失败", failure)
-        self.assertIn("退出码：7", failure)
+        self.assertEqual(success, "\n".join([
+            "[后台任务完成-系统提示]",
+            "任务：python train.py",
+            "日志：/tmp/run.log",
+            "exit_code: 0",
+            "run_id：run1",
+            "wake_id：wake1",
+        ]))
 
 
 class InvocationTests(unittest.TestCase):
@@ -251,7 +252,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(event["delivery"]["state"], wake_state.DELIVERY_PENDING)
             self.assertEqual(event["delivery"]["last_error"], "queue down")
 
-    def test_completion_write_failure_sends_explicit_failure_wake(self) -> None:
+    def test_completion_write_failure_sends_minimal_wake_and_logs_error(self) -> None:
         messages: list[str] = []
 
         def capture_queue(_thread, message, _codex, **kwargs):
@@ -271,8 +272,10 @@ class WorkerTests(unittest.TestCase):
                         run_id="run1",
                     )
             self.assertEqual(exit_code, wake_run.WORKER_STATE_FAILURE)
-            self.assertIn("状态持久化错误", messages[0])
-            self.assertIn("disk full", messages[0])
+            self.assertIn("[后台任务完成-系统提示]", messages[0])
+            self.assertIn("exit_code: 0", messages[0])
+            self.assertIn("completion persistence failed", (directory / "run.log").read_text())
+            self.assertIn("disk full", (directory / "run.log").read_text())
 
 
 class LauncherTests(unittest.TestCase):

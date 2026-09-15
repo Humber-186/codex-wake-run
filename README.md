@@ -76,20 +76,12 @@ It then ends the turn. Nothing polls the job.
 When the script exits, the watcher queues a wake-up into that same thread:
 
 ```text
-[后台任务唤醒通知]
-
-脚本：echo "training started"; sleep 2; echo "done"
-状态：执行完成
-退出码：0
-日志文件：/work/project/.codex-wake-run/b7599ab35869.log
+[后台任务完成-系统提示]
+任务：echo "training started"; sleep 2; echo "done"
+日志：/work/project/.codex-wake-run/b7599ab35869.log
+exit_code: 0
 run_id：b7599ab35869
 wake_id：5e9ca210a8c84d9d97b66a9ec0a79d58
-
-请分析脚本执行结果，然后继续完成原任务。
-若任务已经完成，请直接向用户发送最终结果。
-若脚本执行失败，请分析失败原因，并在合理情况下修复后继续执行。
-
-注：该消息由系统后台唤醒，并非用户亲自发出消息。
 ```
 
 After receiving `armed`, Codex sends one concise confirmation and ends the current turn. It reads the referenced log only after the wake-up arrives, then continues the original task.

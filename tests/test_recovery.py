@@ -227,7 +227,7 @@ class WindowsQueueIntegrationTests(unittest.TestCase):
                 "exit 0\n",
                 encoding="utf-8",
             )
-            message = "[后台任务唤醒通知]\n状态：执行完成\n注：系统后台唤醒"
+            message = "[后台任务完成-系统提示]\n任务：中文任务\nexit_code: 0"
             with mock.patch.dict(os.environ, {"WAKE_CAPTURE": str(capture)}):
                 wake_run.queue_wakeup("thread-win", message, str(fake_codex))
             args = json.loads(capture.read_text(encoding="utf-8"))
@@ -252,7 +252,7 @@ class WindowsQueueIntegrationTests(unittest.TestCase):
                 '@echo off\r\n"%WAKE_PYTHON%" "%WAKE_CAPTURE_SCRIPT%" %*\r\n',
                 encoding="utf-8",
             )
-            message = "[后台任务唤醒通知]\n状态：执行完成\n中文参数保持完整"
+            message = "[后台任务完成-系统提示]\n任务：中文任务\nexit_code: 0"
             environment = {
                 "WAKE_CAPTURE": str(capture),
                 "WAKE_CAPTURE_SCRIPT": str(capture_script),

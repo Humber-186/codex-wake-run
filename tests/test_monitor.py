@@ -360,7 +360,7 @@ raise SystemExit(2)
         self.fail(f"monitor completion was not delivered: {path}")
 
     @unittest.skipIf(os.name == "nt", "POSIX executable integration test")
-    def test_launcher_creates_monitor_and_delivers_summary_to_root(self) -> None:
+    def test_launcher_persists_monitor_summary_and_delivers_minimal_wake(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             fake = self.create_fake_codex(directory)
@@ -381,7 +381,9 @@ raise SystemExit(2)
         self.assertEqual(armed["monitor"]["session_id"], "monitor-integration")
         self.assertEqual(event["monitor"]["triage"][-1]["summary"], "integration complete")
         self.assertEqual(queued[queued.index("--thread") + 1], "root-thread")
-        self.assertIn("监护摘要：integration complete", queued[queued.index("--message") + 1])
+        wake_message = queued[queued.index("--message") + 1]
+        self.assertTrue(wake_message.startswith("[后台任务完成-系统提示]"))
+        self.assertIn("exit_code: 0", wake_message)
 
     @mock.patch.object(wake_run.subprocess, "Popen")
     @mock.patch.object(wake_run, "create_monitor_session", side_effect=RuntimeError("monitor denied"))

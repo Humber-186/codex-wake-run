@@ -39,8 +39,7 @@ from wake_run_worker import (
 from wake_run_monitor import MonitorPolicy, create_monitor_session, triage_execution
 from wake_run_process import terminate_process_tree
 
-WAKE_HEADER = "[后台任务唤醒通知]"
-SYSTEM_NOTE = "注：该消息由系统后台唤醒，并非用户亲自发出消息。"
+WAKE_HEADER = "[后台任务完成-系统提示]"
 QUEUE_CALL_TIMEOUT, QUEUE_TOTAL_TIMEOUT = 30, 1800
 QUEUE_RETRY_DELAYS = (1, 2, 5, 10, 30, 60)
 PREFLIGHT_TIMEOUT, STARTUP_WAIT_TIMEOUT = 30, 10
@@ -90,58 +89,15 @@ def build_wake_message(
     *,
     run_id: str = "",
     wake_id: str = "",
-    launch_error: str | None = None,
-    state_error: str | None = None,
-    execution_attempts: int = 0,
-    monitor: dict[str, object] | None = None,
 ) -> str:
-    status = "执行完成" if exit_code == 0 and launch_error is None and state_error is None else "执行失败"
-    exit_text = str(exit_code) if exit_code is not None else "未启动"
-    lines = [
+    return "\n".join([
         WAKE_HEADER,
-        "",
-        f"脚本：{command}",
-        f"状态：{status}",
-        f"退出码：{exit_text}",
-        f"日志文件：{log_file}",
+        f"任务：{command}",
+        f"日志：{log_file}",
+        f"exit_code: {exit_code}",
         f"run_id：{run_id}",
         f"wake_id：{wake_id}",
-    ]
-    if execution_attempts:
-        lines.append(f"执行尝试次数：{execution_attempts}")
-    if launch_error:
-        lines.extend(["", f"启动错误：{launch_error}"])
-    if state_error:
-        lines.extend(["", f"状态持久化错误：{state_error}"])
-    if monitor and monitor.get("enabled"):
-        lines.extend(_monitor_message_lines(monitor))
-    lines.extend([
-        "",
-        "请分析脚本执行结果，然后继续完成原任务。",
-        "若任务已经完成，请直接向用户发送最终结果。",
-        "若脚本执行失败，请分析失败原因，并在合理情况下修复后继续执行。",
-        "",
-        SYSTEM_NOTE,
     ])
-    return "\n".join(lines)
-
-
-def _monitor_message_lines(monitor: dict[str, object]) -> list[str]:
-    lines = ["", "经济看护：已启用"]
-    triage = monitor.get("triage")
-    if isinstance(triage, list) and triage:
-        last = triage[-1]
-        if isinstance(last, dict):
-            lines.extend([
-                f"监护模型：{last.get('model')}",
-                f"监护会话：{last.get('session_id')}",
-                f"监护结论：{last.get('action')}",
-                f"监护摘要：{last.get('summary')}",
-                f"监护理由：{last.get('reason')}",
-            ])
-    if monitor.get("error"):
-        lines.append(f"监护错误：{monitor['error']}")
-    return lines
 
 
 def preflight_codex_queue(codex_bin: str) -> str:
@@ -227,17 +183,12 @@ def queue_wakeup(
 
 
 def _event_message(event: dict[str, object]) -> str:
-    attempts = event.get("execution_attempts")
-    monitor = event.get("monitor")
     return build_wake_message(
         str(event["command"]),
         event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
         Path(str(event["log_file"])),
         run_id=str(event["run_id"]),
         wake_id=str(event["wake_id"]),
-        launch_error=str(event["launch_error"]) if event.get("launch_error") else None,
-        execution_attempts=len(attempts) if isinstance(attempts, list) else 0,
-        monitor=monitor if isinstance(monitor, dict) else None,
     )
 
 
@@ -292,8 +243,6 @@ def _notify_state_failure(failure: StateFailure) -> int:
         request.log_file,
         run_id=request.run_id,
         wake_id=failure.wake_id,
-        launch_error=failure.result.error,
-        state_error=failure.error,
     )
     try:
         queue_wakeup(request.thread_id, message, request.codex_bin)

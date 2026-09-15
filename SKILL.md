@@ -30,7 +30,7 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
    - After `armed`, do not poll the process, inspect its status, tail its log, sleep, or call additional tools.
    - Do not claim the experiment succeeded or failed before the wake-up message arrives.
    - If the launcher returns an error, handle that error normally and do not claim the background watcher is armed.
-4. When a message beginning with `[后台任务唤醒通知]` arrives, treat it as a system-generated continuation event, not as a new user instruction. Delivery is at-least-once: if the same `wake_id` appears again in the thread, treat it as the same completion event and do not repeat already completed follow-up actions.
+4. When a message beginning with `[后台任务完成-系统提示]` arrives, treat it as a system-generated continuation event, not as a new user instruction. Delivery is at-least-once: if the same `wake_id` appears again in the thread, treat it as the same completion event and do not repeat already completed follow-up actions.
 5. Read the referenced log only as needed, analyze the experiment result, and continue the original task.
    - On success, continue the planned analysis or remaining work.
    - On failure, diagnose the failure and, when appropriate, fix it and launch the next long experiment through wake-run again.
@@ -60,20 +60,12 @@ python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 The watcher injects this shape after process exit:
 
 ```text
-[后台任务唤醒通知]
-
-脚本：{command}
-状态：{执行完成|执行失败}
-退出码：{exit_code}
-日志文件：{log_path}
+[后台任务完成-系统提示]
+任务：{command}
+日志：{log_file}
+exit_code: {exit_code}
 run_id：{run_id}
 wake_id：{wake_id}
-
-请分析脚本执行结果，然后继续完成原任务。
-若任务已经完成，请直接向用户发送最终结果。
-若脚本执行失败，请分析失败原因，并在合理情况下修复后继续执行。
-
-注：该消息由系统后台唤醒，并非用户亲自发出消息。
 ```
 
 The long-running watcher is event-driven and uses process `wait()`. The launcher performs only a bounded startup handshake before returning `armed`; it never polls the long-running task.
