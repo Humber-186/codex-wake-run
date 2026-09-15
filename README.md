@@ -23,7 +23,7 @@ wake-run removes the wait. You hand it the finalized command; it spawns a detach
 | Active Goal protection | A durable, shared lease pauses and verifies an active Goal before target startup; wake delivery succeeds before conditional restoration. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job. |
 | Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
-| Windows and POSIX paths | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. CI defines both platforms; release confidence depends on actual Actions results. |
+| Explicit stable baseline | Reliability targets a few trusted users on Linux with Codex CLI 0.154.0+; Windows paths remain, but are outside the current stability claim. |
 | Durable delivery state | Each run has a log and atomic completion JSON recording delivery attempts, errors, and final state. |
 | Optional economical monitoring | A separate lower-cost Codex session performs event-time triage; the main agent explicitly fixes the model, evidence budget, and exact-retry authorization. |
 | Structural recursion prevention | Monitor-role processes cannot launch or replay wake-run; retries stay inside the existing worker and never create nested watchers. |
@@ -69,7 +69,7 @@ Use the wake-run skill to run this experiment and continue after it exits.
 **Codex** launches the job and gets `armed` back:
 
 ```json
-{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "..."}}
+{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "...", "runtime_scope": "detached", "current_turn_accounting": "not_guaranteed"}}
 ```
 
 It then ends the turn. Nothing polls the job.
@@ -99,6 +99,8 @@ python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir
 ```
 
 Goal protection defaults to `--goal-policy auto`. `require` rejects launch unless the thread has an active Goal. `ignore` explicitly disables protection and should be used only when Goal continuation during the wait is acceptable. Completion JSON tracks wake delivery and Goal release independently, so replay never reruns the target or duplicates a successfully queued wake merely to retry Goal restoration.
+
+Goal Guard mutates the persisted Goal through a separate stdio App Server. This reliably prevents idle continuation, but it does not run inside the current Codex TUI's live runtime. The turn that launches wake-run may therefore be omitted from Goal `tokensUsed`, `timeUsedSeconds`, or budget enforcement; `runtime_scope: detached` and `current_turn_accounting: not_guaranteed` report this limitation explicitly. Codex CLI 0.154.0 exposes no live Goal runtime endpoint to a Skill, so wake-run does not claim complete accounting.
 
 ## Economical Monitoring
 
@@ -148,11 +150,12 @@ Use the wake-run skill to run xxx for me.
 A few things worth knowing:
 
 - **It only works inside a Codex session.** The Skill needs `CODEX_THREAD_ID` to know which thread to wake.
-- **Your Codex CLI needs `codex queue` and App Server Goal methods.** The launcher preflights queue support and verifies Goal reads/writes before target startup. `--goal-policy ignore` is an explicit opt-out.
+- **The stable support baseline is Linux with Codex CLI 0.154.0+.** The launcher preflights `codex queue` and verifies App Server Goal reads/writes before target startup. `--goal-policy ignore` is an explicit opt-out.
 - **Goal RPCs are bounded and visible.** `WAKE_RUN_GOAL_TIMEOUT` defaults to 10 seconds and must be a finite positive value; timeout or protocol errors fail launch instead of degrading silently.
 - **Economical monitoring also needs persistent `codex exec` sessions, structured output, and `codex exec resume`.** Its explicit `WAKE_RUN_MONITOR_TIMEOUT` defaults to 300 seconds.
 - **It is not a way around your sandbox.** The background process inherits the launch environment and its permissions.
-- **One watcher per experiment.** Multiple watchers are fine when the task genuinely requires parallel jobs.
+- **One watcher per experiment.** Parallel jobs are allowed when genuinely needed; a blocking OS lock serializes short Goal lease mutations. If any dead worker lacks a completion while its holder is `spawning` or `running`, the lease becomes persistently `orphaned` and rejects both new watchers and ordinary restoration.
+- **The public Goal API has no compare-and-swap operation.** wake-run strictly checks the exposed identity snapshot, but cannot eliminate the narrow external-mutation window between a read and update.
 
 ## Repository layout
 
@@ -163,6 +166,7 @@ A few things worth knowing:
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Wake delivery, Goal release ordering, and replay. |
 | [`scripts/wake_run_app_server.py`](./scripts/wake_run_app_server.py) | Bounded JSONL client for stable Codex App Server RPC. |
 | [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Shared Goal leases, verification, conflict handling, and recovery. |
+| [`scripts/wake_run_goal_state.py`](./scripts/wake_run_goal_state.py) | Goal lease schema and holder phases. |
 | [`scripts/wake_run_launcher.py`](./scripts/wake_run_launcher.py) | Two-phase supervisor and target startup. |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
@@ -175,6 +179,7 @@ A few things worth knowing:
 | [`tests/test_recovery.py`](./tests/test_recovery.py) | Recovery, persistence-failure, and replay tests. |
 | [`tests/test_monitor.py`](./tests/test_monitor.py) | Economical-monitor plans, protocol, authorized retries, and end-to-end tests. |
 | [`tests/test_process.py`](./tests/test_process.py) | POSIX and Windows process-tree cleanup tests. |
+| [`tests/test_goal_worker.py`](./tests/test_goal_worker.py) | Goal spawn-window, orphan, and blocking-lock tests. |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | Economical-monitor plan and decision contract. |
 
 Run logs default to `.codex-wake-run/` in the project you launch from. This repository ignores that directory, but a host project does not inherit this repository's `.gitignore`; add `.codex-wake-run/` to the host project yourself. For large EDA projects, `--log-dir ~/.codex/wake-run/<project>` keeps frequently updated state off the source tree or NFS storage.

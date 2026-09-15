@@ -9,52 +9,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from wake_run_app_server import AppServerClient, AppServerConfig
-from wake_run_state import atomic_write_json, process_is_alive, process_lock, read_json, utc_now
+from wake_run_app_server import CodexGoalRpc
+from wake_run_goal_state import (
+    HOLDER_PHASE_PREPARED,
+    HOLDER_PHASE_RUNNING,
+    HOLDER_PHASE_SPAWNING,
+    LEASE_PHASE_ORPHANED,
+    LEASE_PHASE_PAUSED,
+    LEASE_PHASE_RESTORED,
+    LEASE_PHASE_SKIPPED,
+    LEASE_SCHEMA_VERSION,
+    TERMINAL_PHASES,
+    holder as _holder,
+    holder_is_abandoned as _holder_is_abandoned,
+    holder_is_orphaned as _holder_is_orphaned,
+    lease_holders as _lease_holders,
+    persist_orphaned as _persist_orphaned,
+    raise_if_orphaned as _raise_if_orphaned,
+    read_lease as _read_existing_lease,
+)
+from wake_run_state import atomic_write_json, process_lock, read_json, utc_now
 
 GOAL_POLICY_AUTO = "auto"
 GOAL_POLICY_REQUIRE = "require"
 GOAL_POLICY_IGNORE = "ignore"
 GOAL_POLICIES = frozenset({GOAL_POLICY_AUTO, GOAL_POLICY_REQUIRE, GOAL_POLICY_IGNORE})
-LEASE_SCHEMA_VERSION = 1
-LEASE_PHASE_PAUSED = "paused"
-LEASE_PHASE_RESTORED = "restored"
-LEASE_PHASE_SKIPPED = "skipped_conflict"
-TERMINAL_PHASES = frozenset({LEASE_PHASE_RESTORED, LEASE_PHASE_SKIPPED})
 
 
 class GoalRpc(Protocol):
     def get_goal(self, thread_id: str) -> dict[str, object] | None: ...
 
     def set_status(self, thread_id: str, status: str) -> dict[str, object]: ...
-
-
-class CodexGoalRpc:
-    def __init__(self, codex_bin: str) -> None:
-        self._client = AppServerClient(AppServerConfig.from_environment(codex_bin))
-
-    def __enter__(self) -> "CodexGoalRpc":
-        self._client.__enter__()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._client.__exit__(*exc)
-
-    def get_goal(self, thread_id: str) -> dict[str, object] | None:
-        result = self._client.request("thread/goal/get", {"threadId": thread_id})
-        goal = result.get("goal")
-        if goal is not None and not isinstance(goal, dict):
-            raise RuntimeError("thread/goal/get returned an invalid goal")
-        return goal
-
-    def set_status(self, thread_id: str, status: str) -> dict[str, object]:
-        result = self._client.request(
-            "thread/goal/set", {"threadId": thread_id, "status": status}
-        )
-        goal = result.get("goal")
-        if not isinstance(goal, dict):
-            raise RuntimeError("thread/goal/set returned an invalid goal")
-        return goal
 
 
 GoalRpcFactory = Callable[[str], GoalRpc]
@@ -75,14 +60,22 @@ class GoalGuard:
     lease_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {"mode": self.mode, "verified": self.verified, "lease_id": self.lease_id}
+        result: dict[str, object] = {
+            "mode": self.mode,
+            "verified": self.verified,
+            "lease_id": self.lease_id,
+        }
+        if self.mode == "paused":
+            result.update({
+                "runtime_scope": "detached",
+                "current_turn_accounting": "not_guaranteed",
+            })
+        return result
 
 
 def goal_lease_root() -> Path:
     codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     return codex_home.expanduser().resolve() / "wake-run" / "goal-leases"
-
-
 def goal_lease_path(context: GoalGuardContext) -> Path:
     digest = hashlib.sha256(context.thread_id.encode("utf-8")).hexdigest()
     return (context.lease_root or goal_lease_root()) / f"{digest}.json"
@@ -100,7 +93,7 @@ def acquire_goal_guard(
     if policy == GOAL_POLICY_IGNORE:
         return GoalGuard(mode="ignored", verified=False)
     lease_path = goal_lease_path(context)
-    with process_lock(lease_path.with_suffix(".lock"), "Goal lease"):
+    with process_lock(lease_path.with_suffix(".lock"), "Goal lease", blocking=True):
         with context.rpc_factory(context.codex_bin) as rpc:
             existing = _read_existing_lease(lease_path, context.thread_id)
             if existing and existing.get("phase") not in TERMINAL_PHASES:
@@ -108,8 +101,8 @@ def acquire_goal_guard(
                     rpc,
                     lease_path,
                     existing,
-                    context.thread_id,
-                    _holder(run_id, worker_pid, completion_file),
+                    thread_id=context.thread_id,
+                    holder=_holder(run_id, worker_pid, completion_file),
                 )
             goal = rpc.get_goal(context.thread_id)
             if goal is None:
@@ -127,16 +120,16 @@ def acquire_goal_guard(
                 rpc,
                 lease_path,
                 context.thread_id,
-                _holder(run_id, worker_pid, completion_file),
-                goal,
+                holder=_holder(run_id, worker_pid, completion_file),
+                original=goal,
             )
 
 
 def release_goal_guard(context: GoalGuardContext, *, lease_id: str) -> str:
     lease_path = goal_lease_path(context)
-    with process_lock(lease_path.with_suffix(".lock"), "Goal lease"):
+    with process_lock(lease_path.with_suffix(".lock"), "Goal lease", blocking=True):
         if not lease_path.exists():
-            return LEASE_PHASE_RESTORED
+            raise RuntimeError(f"Goal lease is missing: {lease_path}")
         lease = _read_existing_lease(lease_path, context.thread_id)
         assert lease is not None
         if lease.get("lease_id") != lease_id:
@@ -144,14 +137,22 @@ def release_goal_guard(context: GoalGuardContext, *, lease_id: str) -> str:
         phase = lease.get("phase")
         if phase in TERMINAL_PHASES:
             return str(phase)
+        _raise_if_orphaned(lease_path, lease)
         with context.rpc_factory(context.codex_bin) as rpc:
-            return _release_owned_lease(rpc, lease_path, lease, context.thread_id)
+            return _release_owned_lease(
+                rpc,
+                lease_path,
+                lease,
+                thread_id=context.thread_id,
+            )
 
 
-def cancel_goal_guard(context: GoalGuardContext, *, run_id: str) -> str:
+def cancel_goal_guard(context: GoalGuardContext, *, run_id: str, lease_id: str | None = None) -> str:
     lease_path = goal_lease_path(context)
-    with process_lock(lease_path.with_suffix(".lock"), "Goal lease"):
+    with process_lock(lease_path.with_suffix(".lock"), "Goal lease", blocking=True):
         if not lease_path.exists():
+            if lease_id is not None:
+                raise RuntimeError(f"Goal lease is missing during cancellation: {lease_path}")
             return "not_needed"
         lease = _read_existing_lease(lease_path, context.thread_id)
         assert lease is not None
@@ -163,25 +164,83 @@ def cancel_goal_guard(context: GoalGuardContext, *, run_id: str) -> str:
             return "not_needed"
         remaining = [holder for holder in holders if holder["run_id"] != run_id]
         if remaining:
-            atomic_write_json(lease_path, {**lease, "holders": remaining, "updated_at": utc_now()})
+            updated = {**lease, "holders": remaining, "updated_at": utc_now()}
+            atomic_write_json(lease_path, updated)
+            _raise_if_orphaned(lease_path, updated)
             return "holder_removed"
         with context.rpc_factory(context.codex_bin) as rpc:
-            return _release_owned_lease(rpc, lease_path, lease, context.thread_id)
+            return _release_owned_lease(
+                rpc,
+                lease_path,
+                lease,
+                thread_id=context.thread_id,
+            )
 
 
-def mark_goal_holder_started(context: GoalGuardContext, *, run_id: str) -> None:
+def mark_goal_holder_spawning(
+    context: GoalGuardContext,
+    *,
+    run_id: str,
+    lease_id: str,
+) -> None:
+    _update_holder_phase(
+        context,
+        run_id=run_id,
+        lease_id=lease_id,
+        expected=frozenset({HOLDER_PHASE_PREPARED, HOLDER_PHASE_RUNNING}),
+        phase=HOLDER_PHASE_SPAWNING,
+        target_pid=None,
+    )
+
+
+def mark_goal_holder_running(
+    context: GoalGuardContext,
+    *,
+    run_id: str,
+    lease_id: str,
+    target_pid: int,
+) -> None:
+    if target_pid <= 0:
+        raise RuntimeError("Goal lease target_pid must be positive")
+    _update_holder_phase(
+        context,
+        run_id=run_id,
+        lease_id=lease_id,
+        expected=frozenset({HOLDER_PHASE_SPAWNING}),
+        phase=HOLDER_PHASE_RUNNING,
+        target_pid=target_pid,
+    )
+
+
+def _update_holder_phase(
+    context: GoalGuardContext,
+    *,
+    run_id: str,
+    lease_id: str,
+    expected: frozenset[str],
+    phase: str,
+    target_pid: int | None,
+) -> None:
     lease_path = goal_lease_path(context)
-    with process_lock(lease_path.with_suffix(".lock"), "Goal lease"):
+    with process_lock(lease_path.with_suffix(".lock"), "Goal lease", blocking=True):
         if not lease_path.exists():
-            return
+            raise RuntimeError(f"Goal lease disappeared before target start: {lease_path}")
         lease = _read_existing_lease(lease_path, context.thread_id)
         assert lease is not None
+        if lease.get("lease_id") != lease_id:
+            raise RuntimeError("Goal lease changed before target start")
+        if lease.get("phase") != LEASE_PHASE_PAUSED:
+            raise RuntimeError(f"Goal lease is not usable in phase {lease.get('phase')}")
         holders = _lease_holders(lease)
         matched = False
         updated: list[dict[str, object]] = []
         for holder in holders:
             if holder["run_id"] == run_id:
-                holder = {**holder, "target_started": True}
+                if holder["phase"] not in expected:
+                    raise RuntimeError(
+                        f"Goal holder {run_id} cannot move from {holder['phase']} to {phase}"
+                    )
+                holder = {**holder, "phase": phase, "target_pid": target_pid}
                 matched = True
             updated.append(holder)
         if not matched:
@@ -193,6 +252,7 @@ def _create_pause_lease(
     rpc: GoalRpc,
     lease_path: Path,
     thread_id: str,
+    *,
     holder: dict[str, object],
     original: dict[str, object],
 ) -> GoalGuard:
@@ -213,7 +273,13 @@ def _create_pause_lease(
         paused = rpc.get_goal(thread_id)
         _verify_paused(original, paused, thread_id)
     except Exception as error:
-        _rollback_pause(rpc, lease_path, lease, thread_id, error)
+        _rollback_pause(
+            rpc,
+            lease_path,
+            lease,
+            thread_id=thread_id,
+            cause=error,
+        )
         raise
     atomic_write_json(lease_path, {
         **lease,
@@ -228,9 +294,11 @@ def _join_lease(
     rpc: GoalRpc,
     lease_path: Path,
     lease: dict[str, object],
+    *,
     thread_id: str,
     holder: dict[str, object],
 ) -> GoalGuard:
+    _raise_if_orphaned(lease_path, lease)
     if lease.get("phase") != LEASE_PHASE_PAUSED:
         raise RuntimeError(f"Goal lease is not joinable in phase {lease.get('phase')}")
     paused = rpc.get_goal(thread_id)
@@ -249,6 +317,7 @@ def _release_owned_lease(
     rpc: GoalRpc,
     lease_path: Path,
     lease: dict[str, object],
+    *,
     thread_id: str,
 ) -> str:
     current = rpc.get_goal(thread_id)
@@ -277,6 +346,7 @@ def _rollback_pause(
     rpc: GoalRpc,
     lease_path: Path,
     lease: dict[str, object],
+    *,
     thread_id: str,
     cause: Exception,
 ) -> None:
@@ -306,50 +376,6 @@ def _finish_lease(path: Path, lease: dict[str, object], phase: str) -> str:
     return phase
 
 
-def _read_existing_lease(path: Path, thread_id: str) -> dict[str, object] | None:
-    if not path.exists():
-        return None
-    lease = read_json(path)
-    if lease.get("schema_version") != LEASE_SCHEMA_VERSION:
-        raise RuntimeError(f"Unsupported Goal lease schema in {path}")
-    if lease.get("thread_id") != thread_id:
-        raise RuntimeError(f"Goal lease thread mismatch in {path}")
-    _lease_holders(lease)
-    return lease
-
-
-def _lease_holders(lease: dict[str, object]) -> list[dict[str, object]]:
-    holders = lease.get("holders")
-    if not isinstance(holders, list) or not all(_valid_holder(item) for item in holders):
-        raise RuntimeError("Goal lease holders are invalid")
-    return [dict(item) for item in holders if isinstance(item, dict)]
-
-
-def _holder(run_id: str, worker_pid: int, completion_file: Path | None) -> dict[str, object]:
-    if not run_id:
-        raise RuntimeError("Goal lease holder run_id must not be empty")
-    if worker_pid < 0:
-        raise RuntimeError("Goal lease holder worker_pid must not be negative")
-    return {
-        "run_id": run_id,
-        "worker_pid": worker_pid,
-        "completion_file": str(completion_file.resolve()) if completion_file else None,
-        "target_started": False,
-    }
-
-
-def _valid_holder(value: object) -> bool:
-    if not isinstance(value, dict):
-        return False
-    completion_file = value.get("completion_file")
-    return (
-        isinstance(value.get("run_id"), str)
-        and isinstance(value.get("worker_pid"), int)
-        and isinstance(value.get("target_started"), bool)
-        and (completion_file is None or isinstance(completion_file, str))
-    )
-
-
 def recover_abandoned_goal_leases(
     *,
     log_dir: Path,
@@ -369,7 +395,12 @@ def recover_abandoned_goal_leases(
         }
     for path in sorted(root.glob("*.json")):
         try:
-            outcome = _recover_lease_file(path, log_dir.resolve(), codex_bin, rpc_factory)
+            outcome = _recover_lease_file(
+                path,
+                log_dir.resolve(),
+                codex_bin,
+                rpc_factory=rpc_factory,
+            )
             if outcome == LEASE_PHASE_RESTORED:
                 restored.append(path.name)
             elif outcome == "retained":
@@ -388,9 +419,10 @@ def _recover_lease_file(
     path: Path,
     log_dir: Path,
     codex_bin: str,
+    *,
     rpc_factory: GoalRpcFactory,
 ) -> str:
-    with process_lock(path.with_suffix(".lock"), "Goal lease"):
+    with process_lock(path.with_suffix(".lock"), "Goal lease", blocking=True):
         raw = read_json(path)
         thread_id_value = raw.get("thread_id")
         if not isinstance(thread_id_value, str):
@@ -402,7 +434,10 @@ def _recover_lease_file(
         holders = _lease_holders(lease)
         if not any(_holder_is_relevant(holder, log_dir) for holder in holders):
             return "unrelated"
+        if lease.get("phase") == LEASE_PHASE_ORPHANED:
+            return "orphaned"
         if any(_holder_is_orphaned(holder, log_dir) for holder in holders):
+            _persist_orphaned(path, lease)
             return "orphaned"
         abandoned = [holder for holder in holders if _holder_is_abandoned(holder, log_dir)]
         if not abandoned:
@@ -413,27 +448,12 @@ def _recover_lease_file(
             return "retained"
         thread_id = thread_id_value
         with rpc_factory(codex_bin) as rpc:
-            return _release_owned_lease(rpc, path, lease, thread_id)
-
-
-def _holder_is_abandoned(holder: dict[str, object], log_dir: Path) -> bool:
-    completion = holder.get("completion_file")
-    if not isinstance(completion, str):
-        return False
-    completion_path = Path(completion)
-    if completion_path.parent != log_dir or completion_path.exists():
-        return False
-    worker_pid = holder.get("worker_pid")
-    return isinstance(worker_pid, int) and not process_is_alive(worker_pid)
+            return _release_owned_lease(rpc, path, lease, thread_id=thread_id)
 
 
 def _holder_is_relevant(holder: dict[str, object], log_dir: Path) -> bool:
     completion = holder.get("completion_file")
     return isinstance(completion, str) and Path(completion).parent == log_dir
-
-
-def _holder_is_orphaned(holder: dict[str, object], log_dir: Path) -> bool:
-    return bool(holder.get("target_started")) and _holder_is_abandoned(holder, log_dir)
 
 
 def _validate_goal(goal: dict[str, object], thread_id: str) -> None:

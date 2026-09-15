@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
 
 import wake_run_core as core
 import wake_run_goal as goal
+import wake_run_goal_state as goal_state_storage
 import wake_run_state as state
 
 
@@ -75,6 +76,10 @@ class GoalLeaseTests(unittest.TestCase):
             guard = goal.acquire_goal_guard(ctx, run_id="run1", policy="auto")
             self.assertEqual(guard.mode, "paused")
             self.assertTrue(guard.verified)
+            self.assertEqual(guard.as_dict()["runtime_scope"], "detached")
+            self.assertEqual(
+                guard.as_dict()["current_turn_accounting"], "not_guaranteed"
+            )
             self.assertEqual(rpc.current["status"], "paused")
             outcome = goal.release_goal_guard(ctx, lease_id=str(guard.lease_id))
             self.assertEqual(outcome, goal.LEASE_PHASE_RESTORED)
@@ -145,6 +150,48 @@ class GoalLeaseTests(unittest.TestCase):
             self.assertEqual(lease["phase"], goal.LEASE_PHASE_PAUSED)
             self.assertEqual(rpc.current["status"], "paused")
 
+    def test_missing_paused_lease_is_not_reported_as_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeGoalRpc(goal_state())
+            ctx = context(Path(tmp), rpc)
+            guard = goal.acquire_goal_guard(ctx, run_id="run1", policy="auto")
+            goal.goal_lease_path(ctx).unlink()
+            with self.assertRaisesRegex(RuntimeError, "Goal lease is missing"):
+                goal.release_goal_guard(ctx, lease_id=str(guard.lease_id))
+            self.assertEqual(rpc.current["status"], "paused")
+
+    def test_missing_lease_blocks_target_spawn_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeGoalRpc(goal_state())
+            ctx = context(Path(tmp), rpc)
+            guard = goal.acquire_goal_guard(ctx, run_id="run1", policy="auto")
+            goal.goal_lease_path(ctx).unlink()
+            with self.assertRaisesRegex(RuntimeError, "disappeared before target start"):
+                goal.mark_goal_holder_spawning(
+                    ctx,
+                    run_id="run1",
+                    lease_id=str(guard.lease_id),
+                )
+
+    def test_version_one_holder_is_upgraded_without_losing_started_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeGoalRpc(goal_state())
+            ctx = context(Path(tmp), rpc)
+            goal.acquire_goal_guard(ctx, run_id="run1", policy="auto")
+            path = goal.goal_lease_path(ctx)
+            lease = state.read_json(path)
+            legacy_holder = {**lease["holders"][0], "target_started": True}
+            legacy_holder.pop("phase")
+            legacy_holder.pop("target_pid")
+            state.atomic_write_json(path, {
+                **lease,
+                "schema_version": 1,
+                "holders": [legacy_holder],
+            })
+            upgraded = goal_state_storage.read_lease(path, "thread1")
+            self.assertEqual(upgraded["schema_version"], 2)
+            self.assertEqual(upgraded["holders"][0]["phase"], "running")
+
     def test_replay_restores_abandoned_pre_completion_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -159,7 +206,9 @@ class GoalLeaseTests(unittest.TestCase):
                 worker_pid=999_999_999,
                 completion_file=logs / "run.completion.json",
             )
-            with mock.patch.object(goal, "process_is_alive", return_value=False):
+            with mock.patch.object(
+                goal_state_storage, "process_is_alive", return_value=False
+            ):
                 result = goal.recover_abandoned_goal_leases(
                     log_dir=logs,
                     codex_bin="codex",
@@ -191,7 +240,9 @@ class GoalLeaseTests(unittest.TestCase):
                         logs.mkdir()
                         completion.write_text("{}", encoding="utf-8")
                     with mock.patch.object(
-                        goal, "process_is_alive", return_value=process_alive
+                        goal_state_storage,
+                        "process_is_alive",
+                        return_value=process_alive,
                     ):
                         result = goal.recover_abandoned_goal_leases(
                             log_dir=logs,
@@ -209,15 +260,21 @@ class GoalLeaseTests(unittest.TestCase):
             logs = directory / "logs"
             rpc = FakeGoalRpc(goal_state())
             ctx = context(leases, rpc)
-            goal.acquire_goal_guard(
+            guard = goal.acquire_goal_guard(
                 ctx,
                 run_id="run1",
                 policy="auto",
                 worker_pid=999_999_999,
                 completion_file=logs / "run.completion.json",
             )
-            goal.mark_goal_holder_started(ctx, run_id="run1")
-            with mock.patch.object(goal, "process_is_alive", return_value=False):
+            goal.mark_goal_holder_spawning(
+                ctx,
+                run_id="run1",
+                lease_id=str(guard.lease_id),
+            )
+            with mock.patch.object(
+                goal_state_storage, "process_is_alive", return_value=False
+            ):
                 result = goal.recover_abandoned_goal_leases(
                     log_dir=logs,
                     codex_bin="codex",
@@ -226,6 +283,52 @@ class GoalLeaseTests(unittest.TestCase):
                 )
             self.assertEqual(len(result["orphaned"]), 1)
             self.assertEqual(rpc.current["status"], "paused")
+            lease = state.read_json(goal.goal_lease_path(ctx))
+            self.assertEqual(lease["phase"], goal.LEASE_PHASE_ORPHANED)
+
+    def test_orphan_holder_blocks_other_holder_release_and_join(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            logs = directory / "logs"
+            rpc = FakeGoalRpc(goal_state())
+            ctx = context(directory / "leases", rpc)
+            first = goal.acquire_goal_guard(
+                ctx,
+                run_id="run1",
+                policy="auto",
+                worker_pid=101,
+                completion_file=logs / "run1.completion.json",
+            )
+            goal.acquire_goal_guard(
+                ctx,
+                run_id="run2",
+                policy="auto",
+                worker_pid=202,
+                completion_file=logs / "run2.completion.json",
+            )
+            goal.mark_goal_holder_spawning(
+                ctx,
+                run_id="run1",
+                lease_id=str(first.lease_id),
+            )
+            logs.mkdir()
+            (logs / "run2.completion.json").write_text("{}", encoding="utf-8")
+            with mock.patch.object(
+                goal_state_storage, "process_is_alive", return_value=False
+            ):
+                with self.assertRaisesRegex(RuntimeError, "orphaned holder"):
+                    goal.release_goal_guard(ctx, lease_id=str(first.lease_id))
+                with self.assertRaisesRegex(RuntimeError, "orphaned"):
+                    goal.acquire_goal_guard(
+                        ctx,
+                        run_id="run3",
+                        policy="auto",
+                        worker_pid=303,
+                        completion_file=logs / "run3.completion.json",
+                    )
+            self.assertEqual(rpc.current["status"], "paused")
+            lease = state.read_json(goal.goal_lease_path(ctx))
+            self.assertEqual(lease["phase"], goal.LEASE_PHASE_ORPHANED)
 
 
 class GoalDeliveryTests(unittest.TestCase):
@@ -285,6 +388,26 @@ class GoalDeliveryTests(unittest.TestCase):
                 ):
                     core.deliver_completion(event, "codex")
             queued.assert_not_called()
+
+    def test_release_error_stays_retryable_after_wake_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            event = self.create_event(Path(tmp))
+            state.update_delivery(
+                event,
+                state=state.DELIVERY_DELIVERED,
+                attempts=1,
+                last_error=None,
+            )
+            with mock.patch.object(
+                core,
+                "release_goal_guard",
+                side_effect=RuntimeError("Goal lease is missing"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Goal lease is missing"):
+                    core.deliver_completion(event, "codex")
+            payload = state.read_json(event)
+            self.assertEqual(payload["goal_release"]["state"], state.GOAL_RELEASE_RETRYING)
+            self.assertIn("Goal lease is missing", payload["goal_release"]["last_error"])
 
 
 if __name__ == "__main__":

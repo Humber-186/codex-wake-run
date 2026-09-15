@@ -104,11 +104,17 @@ def _cancel_after_failure(
     worker: subprocess.Popen[bytes],
     context: GoalGuardContext,
     run_id: str,
+    *,
     error: Exception,
+    guard: GoalGuard | None,
 ) -> None:
     terminate_process_tree(worker, timeout=WORKER_STOP_TIMEOUT)
     try:
-        cancel_goal_guard(context, run_id=run_id)
+        cancel_goal_guard(
+            context,
+            run_id=run_id,
+            lease_id=guard.lease_id if guard is not None else None,
+        )
     except Exception as cancel_error:
         raise RuntimeError(
             f"{error}; Goal guard cancellation failed: {type(cancel_error).__name__}: {cancel_error}"
@@ -187,7 +193,7 @@ def arm_watcher(
         running = _wait_for_state(worker, startup_file, "running", timeout=timeout)
         _validate_worker_status(worker, running, run_id, require_process=True)
     except Exception as error:
-        _cancel_after_failure(worker, context, run_id, error)
+        _cancel_after_failure(worker, context, run_id, error=error, guard=guard)
         raise
     cleanup_warnings = _cleanup_handshake_files(startup_file, gate_file)
     assert guard is not None

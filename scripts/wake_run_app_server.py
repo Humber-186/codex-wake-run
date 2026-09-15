@@ -151,3 +151,33 @@ class AppServerClient:
         if self._process is None:
             raise RuntimeError("Codex App Server client is not started")
         return self._process
+
+
+class CodexGoalRpc:
+    """Goal RPC adapter backed by one detached stdio App Server."""
+
+    def __init__(self, codex_bin: str) -> None:
+        self._client = AppServerClient(AppServerConfig.from_environment(codex_bin))
+
+    def __enter__(self) -> "CodexGoalRpc":
+        self._client.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._client.__exit__(*exc)
+
+    def get_goal(self, thread_id: str) -> dict[str, object] | None:
+        result = self._client.request("thread/goal/get", {"threadId": thread_id})
+        goal = result.get("goal")
+        if goal is not None and not isinstance(goal, dict):
+            raise RuntimeError("thread/goal/get returned an invalid goal")
+        return goal
+
+    def set_status(self, thread_id: str, status: str) -> dict[str, object]:
+        result = self._client.request(
+            "thread/goal/set", {"threadId": thread_id, "status": status}
+        )
+        goal = result.get("goal")
+        if not isinstance(goal, dict):
+            raise RuntimeError("thread/goal/set returned an invalid goal")
+        return goal

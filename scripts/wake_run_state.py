@@ -326,14 +326,19 @@ def process_is_alive(pid: int) -> bool:
 
 
 @contextmanager
-def process_lock(lock_file: Path, description: str) -> Iterator[None]:
+def process_lock(
+    lock_file: Path,
+    description: str,
+    *,
+    blocking: bool = False,
+) -> Iterator[None]:
     ensure_private_directory(lock_file.parent)
     descriptor = os.open(lock_file, os.O_CREAT | os.O_RDWR, PRIVATE_FILE_MODE)
     if os.name != "nt":
         os.chmod(lock_file, PRIVATE_FILE_MODE)
     acquired = False
     try:
-        _acquire_os_lock(descriptor, description, lock_file)
+        _acquire_os_lock(descriptor, description, lock_file, blocking=blocking)
         acquired = True
         payload = json.dumps({"pid": os.getpid(), "created_at": utc_now()}).encode("utf-8")
         os.ftruncate(descriptor, 0)
@@ -346,7 +351,13 @@ def process_lock(lock_file: Path, description: str) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _acquire_os_lock(descriptor: int, description: str, path: Path) -> None:
+def _acquire_os_lock(
+    descriptor: int,
+    description: str,
+    path: Path,
+    *,
+    blocking: bool,
+) -> None:
     try:
         if os.name == "nt":
             import msvcrt
@@ -354,11 +365,13 @@ def _acquire_os_lock(descriptor: int, description: str, path: Path) -> None:
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
             os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            msvcrt.locking(descriptor, mode, 1)
             return
         import fcntl
 
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(descriptor, flags)
     except (BlockingIOError, OSError) as error:
         if error.errno not in {errno.EACCES, errno.EAGAIN}:
             raise

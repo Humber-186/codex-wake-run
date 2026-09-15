@@ -23,7 +23,7 @@ wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启�
 | active Goal 保护 | 目标启动前用持久化共享租约暂停并验证 Goal；完成消息成功入队后才有条件恢复。 |
 | 唤醒同一条线程 | 守护进程调用 `codex queue --thread "$CODEX_THREAD_ID"`，续跑消息回到发起任务的那次对话。 |
 | 失败始终可见 | 命令非零退出会唤醒线程；worker 或目标进程启动失败会在返回 `armed` 前同步报错。 |
-| Windows 与 POSIX 路径 | Windows 走 PowerShell，POSIX 走 `bash -o pipefail`，并处理 `codex.ps1` shim；仓库 CI 定义双平台测试，发布可靠性以实际 Actions 结果为准。 |
+| 明确稳定基线 | 稳定目标是少量可信用户、Linux 与 Codex CLI 0.154.0+；Windows 路径仍保留，但不属于当前可靠性承诺。 |
 | 持久化投递状态 | 每次运行具有独立日志和原子 completion JSON，记录投递次数、错误与最终状态。 |
 | 可选经济看护 | 独立的低成本 Codex 会话按事件分诊；模型、证据范围和原命令重试次数均由主 agent 的计划明确授权。 |
 | 结构化递归防护 | 监护角色不能再次启动或补发 wake-run；重试由现有 worker 内部执行，不会创建嵌套 watcher。 |
@@ -69,7 +69,7 @@ Codex 被唤醒并继续原任务
 **Codex** 启动任务并拿到 `armed`：
 
 ```json
-{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "..."}}
+{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "...", "runtime_scope": "detached", "current_turn_accounting": "not_guaranteed"}}
 ```
 
 随后当前轮次结束，不会轮询后台任务。
@@ -99,6 +99,8 @@ python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <运行状态�
 ```
 
 Goal 保护默认使用 `--goal-policy auto`。`require` 会在当前线程没有 active Goal 时拒绝启动；`ignore` 会显式禁用保护，只应在可以接受等待期间 Goal 自动续跑时使用。completion JSON 分别跟踪唤醒投递和 Goal 释放，因此只重试恢复 Goal 时不会重新运行目标，也不会重复已经成功入队的唤醒消息。
+
+Goal Guard 通过独立的 stdio App Server 修改持久化 Goal，能够可靠阻止 idle continuation，但它不在当前 Codex TUI 的 live runtime 内。因此，启动 wake-run 的当前 turn 可能不会计入 Goal 的 `tokensUsed`、`timeUsedSeconds` 或预算判定；`runtime_scope: detached` 与 `current_turn_accounting: not_guaranteed` 会明确报告这一限制。Codex CLI 0.154.0 没有向 Skill 暴露当前 TUI 的 live Goal runtime endpoint，wake-run 不会伪装成完整记账。
 
 ## 经济看护
 
@@ -148,11 +150,12 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 几件值得知道的事：
 
 - **只能在 Codex 会话内工作。** Skill 依赖 `CODEX_THREAD_ID` 判断应该唤醒哪条线程。
-- **Codex CLI 需要支持 `codex queue` 与 App Server Goal 接口。** 启动器会预检 queue，并在目标启动前读回验证 Goal。`--goal-policy ignore` 是显式退出保护。
+- **稳定支持基线是 Linux + Codex CLI 0.154.0+。** 启动器会预检 `codex queue`，并在目标启动前读回验证 App Server Goal 接口。`--goal-policy ignore` 是显式退出保护。
 - **Goal RPC 有明确时限且失败可见。** `WAKE_RUN_GOAL_TIMEOUT` 默认 10 秒，必须为有限正数；超时或协议错误会让启动失败，不会静默降级。
 - **经济看护还需要持久 `codex exec` 会话、结构化输出和 `codex exec resume`。** 监护调用超时由显式的 `WAKE_RUN_MONITOR_TIMEOUT` 控制，默认 300 秒。
 - **它不是绕过沙箱的手段。** 后台进程继承启动环境及其权限。
-- **每个实验一个 watcher。** 任务确实需要时可以并行运行多个。
+- **每个实验一个 watcher。** 任务确实需要时可以并行运行多个；Goal lease 使用阻塞式操作系统锁串行化短暂变更。任一 dead worker 在 `spawning/running` 阶段缺少 completion 时，整个 lease 固化为 `orphaned`，拒绝新 watcher 加入和普通恢复。
+- **公开 Goal API 没有 CAS。** wake-run 会按公开身份字段严格校验快照，但无法消除读取与更新之间极窄的外部并发修改窗口。
 
 ## 仓库结构
 
@@ -163,6 +166,7 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 | [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | 唤醒投递、Goal 释放顺序与补发。 |
 | [`scripts/wake_run_app_server.py`](./scripts/wake_run_app_server.py) | 有界的 Codex App Server JSONL 客户端。 |
 | [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Goal 共享租约、验证、冲突处理与恢复。 |
+| [`scripts/wake_run_goal_state.py`](./scripts/wake_run_goal_state.py) | Goal lease schema 与 holder 阶段。 |
 | [`scripts/wake_run_launcher.py`](./scripts/wake_run_launcher.py) | 两阶段 supervisor 与目标启动。 |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | 监护计划、Codex 会话、结构化分诊与递归防护。 |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | 目标进程执行与完成事件持久化。 |
@@ -175,6 +179,7 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 | [`tests/test_recovery.py`](./tests/test_recovery.py) | 恢复、持久化失败与补发测试。 |
 | [`tests/test_monitor.py`](./tests/test_monitor.py) | 经济看护计划、协议、授权重试和端到端测试。 |
 | [`tests/test_process.py`](./tests/test_process.py) | POSIX 与 Windows 进程树清理测试。 |
+| [`tests/test_goal_worker.py`](./tests/test_goal_worker.py) | Goal 启动窗口、orphan 与阻塞锁测试。 |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | 经济看护计划与决策契约。 |
 
 运行日志默认写入启动任务所在项目的 `.codex-wake-run/` 目录。仓库自身会忽略该目录，但宿主项目不会自动继承本仓库的 `.gitignore`；请在宿主项目中自行加入 `.codex-wake-run/`。大型 EDA 项目可通过 `--log-dir ~/.codex/wake-run/<project>` 把高频状态写入本地磁盘，避免源码仓库或 NFS 路径。

@@ -13,7 +13,12 @@ from typing import BinaryIO, Callable
 from wake_run_metrics import collect_metrics, cpu_usage_snapshot
 from wake_run_platform import build_experiment_invocation
 from wake_run_process import ProcessTreeSignalGuard, target_popen_kwargs, terminate_process_tree
-from wake_run_goal import GoalGuardContext, cancel_goal_guard, mark_goal_holder_started
+from wake_run_goal import (
+    GoalGuardContext,
+    cancel_goal_guard,
+    mark_goal_holder_running,
+    mark_goal_holder_spawning,
+)
 from wake_run_state import (
     create_completion_event,
     open_private_log,
@@ -95,6 +100,15 @@ def _error_text(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
 
 
+def _paused_lease_id(goal_guard: dict[str, object]) -> str | None:
+    if goal_guard.get("mode") != "paused":
+        return None
+    lease_id = goal_guard.get("lease_id")
+    if goal_guard.get("verified") is not True or not isinstance(lease_id, str) or not lease_id:
+        raise RuntimeError("paused Goal guard is not verified or has no lease id")
+    return lease_id
+
+
 def _cleanup_failure(process: subprocess.Popen[bytes], error: Exception) -> str:
     primary = _error_text(error)
     try:
@@ -110,8 +124,17 @@ def _start_process(
     signal_guard: ProcessTreeSignalGuard,
     *,
     confirm_startup: bool,
+    goal_guard: dict[str, object],
 ) -> tuple[subprocess.Popen[bytes] | None, str | None, bool]:
+    process: subprocess.Popen[bytes] | None = None
     try:
+        lease_id = _paused_lease_id(goal_guard)
+        if lease_id is not None:
+            mark_goal_holder_spawning(
+                GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
+                run_id=request.run_id,
+                lease_id=lease_id,
+            )
         process = subprocess.Popen(
             build_experiment_invocation(request.command),
             cwd=str(request.cwd),
@@ -121,15 +144,16 @@ def _start_process(
             **target_popen_kwargs(),
         )
         signal_guard.attach(process)
-        if request.gate_file is not None:
-            try:
-                mark_goal_holder_started(
-                    GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
-                    run_id=request.run_id,
-                )
-            except Exception as error:
-                return None, _cleanup_failure(process, error), False
+        if lease_id is not None:
+            mark_goal_holder_running(
+                GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
+                run_id=request.run_id,
+                lease_id=lease_id,
+                target_pid=process.pid,
+            )
     except Exception as error:
+        if process is not None:
+            return None, _cleanup_failure(process, error), False
         return None, _error_text(error), not confirm_startup
     if not confirm_startup or request.startup_file is None:
         return process, None, True
@@ -153,6 +177,7 @@ def _execute(
     *,
     attempt_number: int,
     confirm_startup: bool,
+    goal_guard: dict[str, object],
 ) -> ExecutionResult:
     started_at = time.monotonic()
     before_cpu = cpu_usage_snapshot()
@@ -169,6 +194,7 @@ def _execute(
                     log,
                     signal_guard,
                     confirm_startup=confirm_startup,
+                    goal_guard=goal_guard,
                 )
                 if error is not None:
                     log.write(f"\n[wake-run] execution failed: {error}\n".encode("utf-8"))
@@ -255,6 +281,7 @@ def _decision_record(attempt: int, decision: TriageDecision) -> dict[str, object
 def _execute_attempts(
     request: WorkerRequest,
     triage: TriageCallback | None,
+    goal_guard: dict[str, object],
 ) -> WorkerOutcome:
     attempts: list[dict[str, object]] = []
     decisions: list[dict[str, object]] = []
@@ -268,6 +295,7 @@ def _execute_attempts(
             request,
             attempt_number=attempt_number,
             confirm_startup=attempt_number == 1 and request.startup_file is not None,
+            goal_guard=goal_guard,
         )
         attempts.append(_attempt_record(attempt_number, result))
         if result.duration_seconds is not None:
@@ -333,6 +361,7 @@ def _report_startup_failure(
             cancel_goal_guard(
                 GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
                 run_id=request.run_id,
+                lease_id=str(goal_guard["lease_id"]),
             )
         except Exception as error:
             cancellation_failed = True
@@ -433,7 +462,7 @@ def run_worker(
         goal_guard = _await_commit_gate(request)
     except Exception as error:
         return _report_gate_failure(request, error)
-    outcome = _execute_attempts(request, triage)
+    outcome = _execute_attempts(request, triage, goal_guard)
     result = outcome.result
     if not result.startup_confirmed:
         return _report_startup_failure(request, result, goal_guard)
