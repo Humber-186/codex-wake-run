@@ -13,7 +13,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from wake_run_core import arm_watcher, replay_pending, run_worker  # noqa: E402
+from wake_run_core import replay_pending, run_worker  # noqa: E402
+from wake_run_goal import GOAL_POLICIES, GOAL_POLICY_AUTO  # noqa: E402
+from wake_run_launcher import arm_watcher  # noqa: E402
 from wake_run_monitor import load_monitor_policy, reject_recursive_launch  # noqa: E402
 
 
@@ -28,6 +30,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-dir", help="Run state directory; defaults to <cwd>/.codex-wake-run.")
     parser.add_argument("--codex-bin", default="codex", help="Codex CLI executable.")
     parser.add_argument(
+        "--goal-policy",
+        choices=sorted(GOAL_POLICIES),
+        default=GOAL_POLICY_AUTO,
+        help="Goal protection policy (default: auto).",
+    )
+    parser.add_argument(
         "--monitor-plan",
         help="Enable economical monitoring with an explicit JSON authorization plan.",
     )
@@ -36,6 +44,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-file", help=argparse.SUPPRESS)
     parser.add_argument("--run-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--startup-file", help=argparse.SUPPRESS)
+    parser.add_argument("--gate-file", help=argparse.SUPPRESS)
+    parser.add_argument("--launcher-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--monitor-plan-file", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
@@ -63,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.thread_id or not args.log_file or not args.command:
             raise SystemExit("worker mode requires --thread-id, --log-file, and --command")
         startup_file = Path(args.startup_file).expanduser().resolve() if args.startup_file else None
+        gate_file = Path(args.gate_file).expanduser().resolve() if args.gate_file else None
         monitor_plan_file = (
             Path(args.monitor_plan_file).expanduser().resolve() if args.monitor_plan_file else None
         )
@@ -74,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             codex_bin=args.codex_bin,
             run_id=args.run_id,
             startup_file=startup_file,
+            gate_file=gate_file,
+            launcher_pid=args.launcher_pid,
             monitor_plan_file=monitor_plan_file,
         )
     thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
@@ -91,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         log_dir=log_dir,
         codex_bin=args.codex_bin,
         monitor_policy=monitor_policy,
+        goal_policy=args.goal_policy,
     )
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0

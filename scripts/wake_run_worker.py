@@ -13,7 +13,14 @@ from typing import BinaryIO, Callable
 from wake_run_metrics import collect_metrics, cpu_usage_snapshot
 from wake_run_platform import build_experiment_invocation
 from wake_run_process import ProcessTreeSignalGuard, target_popen_kwargs, terminate_process_tree
-from wake_run_state import create_completion_event, open_private_log, write_startup_status
+from wake_run_goal import GoalGuardContext, cancel_goal_guard, mark_goal_holder_started
+from wake_run_state import (
+    create_completion_event,
+    open_private_log,
+    process_is_alive,
+    read_json,
+    write_startup_status,
+)
 
 WORKER_DELIVERY_FAILURE = 70
 WORKER_STATE_FAILURE = 74
@@ -21,6 +28,7 @@ WORKER_MONITOR_FAILURE = 75
 WORKER_STARTUP_FAILURE = 127
 TRIAGE_RETRY_EXACT = "retry_exact"
 TRIAGE_TERMINAL_ACTIONS = frozenset({"report_success", "escalate"})
+GATE_CHECK_INTERVAL = 0.05
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,8 @@ class WorkerRequest:
     run_id: str
     startup_file: Path | None
     monitor_plan_file: Path | None = None
+    gate_file: Path | None = None
+    launcher_pid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +83,7 @@ class StateFailure:
     outcome: WorkerOutcome
     wake_id: str
     error: str
+    goal_guard: dict[str, object]
 
 
 CompletionDelivery = Callable[[Path, str], None]
@@ -110,6 +121,14 @@ def _start_process(
             **target_popen_kwargs(),
         )
         signal_guard.attach(process)
+        if request.gate_file is not None:
+            try:
+                mark_goal_holder_started(
+                    GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
+                    run_id=request.run_id,
+                )
+            except Exception as error:
+                return None, _cleanup_failure(process, error), False
     except Exception as error:
         return None, _error_text(error), not confirm_startup
     if not confirm_startup or request.startup_file is None:
@@ -300,23 +319,39 @@ def _accumulate_metric(total: float | None, value: float | None) -> float | None
     return total + value
 
 
-def _report_startup_failure(request: WorkerRequest, result: ExecutionResult) -> int:
+def _report_startup_failure(
+    request: WorkerRequest,
+    result: ExecutionResult,
+    goal_guard: dict[str, object],
+) -> int:
     assert request.startup_file is not None
     assert result.error is not None
+    detail = result.error
+    cancellation_failed = False
+    if goal_guard.get("lease_id"):
+        try:
+            cancel_goal_guard(
+                GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
+                run_id=request.run_id,
+            )
+        except Exception as error:
+            cancellation_failed = True
+            detail = f"{detail}; Goal guard cancellation failed: {_error_text(error)}"
     write_startup_status(
         request.startup_file,
         state="startup_failed",
         run_id=request.run_id,
         worker_pid=os.getpid(),
-        error=result.error,
+        error=detail,
     )
-    return WORKER_STARTUP_FAILURE
+    return WORKER_STATE_FAILURE if cancellation_failed else WORKER_STARTUP_FAILURE
 
 
 def _persist_completion(
     request: WorkerRequest,
     outcome: WorkerOutcome,
     wake_id: str,
+    goal_guard: dict[str, object],
 ) -> Path:
     return create_completion_event(
         request.log_file,
@@ -333,7 +368,58 @@ def _persist_completion(
         monitor_plan_file=str(request.monitor_plan_file) if request.monitor_plan_file else None,
         monitor_triage=list(outcome.triage),
         monitor_error=outcome.monitor_error,
+        goal_guard=goal_guard,
     )
+
+
+def _await_commit_gate(request: WorkerRequest) -> dict[str, object]:
+    if request.startup_file is None and request.gate_file is None:
+        return {"mode": "not_needed", "verified": True, "lease_id": None}
+    if request.startup_file is None or request.gate_file is None:
+        raise RuntimeError("worker startup_file and gate_file must be provided together")
+    if request.launcher_pid is None or request.launcher_pid <= 0:
+        raise RuntimeError("two-phase worker requires a valid launcher_pid")
+    write_startup_status(
+        request.startup_file,
+        state="prepared",
+        run_id=request.run_id,
+        worker_pid=os.getpid(),
+    )
+    while not request.gate_file.exists():
+        if not process_is_alive(request.launcher_pid):
+            raise RuntimeError("wake-run launcher exited before committing the launch gate")
+        time.sleep(GATE_CHECK_INTERVAL)
+    gate = read_json(request.gate_file)
+    if gate.get("state") != "committed" or gate.get("run_id") != request.run_id:
+        raise RuntimeError("wake-run launch commit gate is invalid")
+    goal_guard = gate.get("goal_guard")
+    if not isinstance(goal_guard, dict):
+        raise RuntimeError("wake-run launch commit gate has no Goal guard")
+    return goal_guard
+
+
+def _report_gate_failure(request: WorkerRequest, error: Exception) -> int:
+    detail = _error_text(error)
+    cancel_error: Exception | None = None
+    try:
+        cancel_goal_guard(
+            GoalGuardContext(thread_id=request.thread_id, codex_bin=request.codex_bin),
+            run_id=request.run_id,
+        )
+    except Exception as caught:
+        cancel_error = caught
+        detail = f"{detail}; Goal guard cancellation failed: {_error_text(caught)}"
+    assert request.startup_file is not None
+    write_startup_status(
+        request.startup_file,
+        state="startup_failed",
+        run_id=request.run_id,
+        worker_pid=os.getpid(),
+        error=detail,
+    )
+    if cancel_error is not None:
+        return WORKER_STATE_FAILURE
+    return WORKER_STARTUP_FAILURE
 
 
 def run_worker(
@@ -343,13 +429,17 @@ def run_worker(
     notify_state_failure: StateFailureNotifier,
     triage: TriageCallback | None = None,
 ) -> int:
+    try:
+        goal_guard = _await_commit_gate(request)
+    except Exception as error:
+        return _report_gate_failure(request, error)
     outcome = _execute_attempts(request, triage)
     result = outcome.result
     if not result.startup_confirmed:
-        return _report_startup_failure(request, result)
+        return _report_startup_failure(request, result, goal_guard)
     wake_id = uuid.uuid4().hex
     try:
-        completion_file = _persist_completion(request, outcome, wake_id)
+        completion_file = _persist_completion(request, outcome, wake_id, goal_guard)
     except Exception as error:
         state_error = _error_text(error)
         with open_private_log(request.log_file) as log:
@@ -359,6 +449,7 @@ def run_worker(
             outcome=outcome,
             wake_id=wake_id,
             error=state_error,
+            goal_guard=goal_guard,
         ))
     try:
         deliver(completion_file, request.codex_bin)

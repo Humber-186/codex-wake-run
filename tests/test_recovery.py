@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import wake_run_core as wake_run
+import wake_run_launcher as wake_launcher
 import wake_run_state as wake_state
 import wake_run_worker as worker_runtime
 
@@ -55,7 +56,9 @@ class RecoveryTests(unittest.TestCase):
             with mock.patch.object(wake_state, "_process_is_alive", return_value=False):
                 with wake_state.delivery_lock(event):
                     self.assertTrue(lock.exists())
-            self.assertFalse(lock.exists())
+            self.assertTrue(lock.exists())
+            with wake_state.delivery_lock(event):
+                self.assertTrue(lock.exists())
 
     def test_replay_reports_live_delivery_as_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,14 +84,31 @@ class RecoveryTests(unittest.TestCase):
             self.assertIn(malformed.name, result["failures"])
             self.assertIn("JSONDecodeError", result["failures"][malformed.name])
 
+    def test_version_one_completion_replays_without_goal_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            event = create_event(directory)
+            payload = wake_state.read_json(event)
+            payload["schema_version"] = 1
+            payload.pop("goal_guard")
+            payload.pop("goal_release")
+            wake_state.atomic_write_json(event, payload)
+            with mock.patch.object(wake_run, "preflight_codex_queue", return_value="/codex"):
+                with mock.patch.object(wake_run, "queue_wakeup", side_effect=successful_queue):
+                    result = wake_run.replay_pending(log_dir=directory, codex_bin="codex")
+            self.assertEqual(result["status"], "replay_complete")
+            self.assertEqual(wake_state.read_json(event)["delivery"]["state"], "delivered")
+
     def test_worker_creation_failure_is_persisted_and_raised(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             state_dir = directory / "state"
-            with mock.patch.object(wake_run, "preflight_codex_queue", return_value="/codex"):
-                with mock.patch.object(wake_run.subprocess, "Popen", side_effect=OSError("spawn denied")):
+            with mock.patch.object(wake_launcher, "preflight_codex_queue", return_value="/codex"):
+                with mock.patch.object(
+                    wake_launcher.subprocess, "Popen", side_effect=OSError("spawn denied")
+                ):
                     with self.assertRaisesRegex(RuntimeError, "spawn denied"):
-                        wake_run.arm_watcher(
+                        wake_launcher.arm_watcher(
                             thread_id="thread",
                             command="echo no",
                             cwd=directory,
@@ -99,7 +119,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(len(startup_files), 1)
             self.assertEqual(wake_state.read_json(startup_files[0])["state"], "startup_failed")
 
-    @mock.patch.object(wake_run, "preflight_codex_queue")
+    @mock.patch.object(wake_launcher, "preflight_codex_queue")
     def test_missing_cwd_is_rejected_before_preflight_or_state_creation(
         self,
         preflight: mock.Mock,
@@ -107,7 +127,7 @@ class RecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "misspelled" / "project"
             with self.assertRaisesRegex(RuntimeError, "does not exist or is not a directory"):
-                wake_run.arm_watcher(
+                wake_launcher.arm_watcher(
                     thread_id="thread",
                     command="echo never",
                     cwd=missing,
@@ -117,9 +137,9 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(missing.exists())
         preflight.assert_not_called()
 
-    @mock.patch.object(wake_run, "_wait_for_startup", side_effect=RuntimeError("bad status"))
-    @mock.patch.object(wake_run.subprocess, "Popen")
-    @mock.patch.object(wake_run, "terminate_process_tree")
+    @mock.patch.object(wake_launcher, "_wait_for_state", side_effect=RuntimeError("bad status"))
+    @mock.patch.object(wake_launcher.subprocess, "Popen")
+    @mock.patch.object(wake_launcher, "terminate_process_tree")
     def test_handshake_failure_terminates_worker_process_tree(
         self,
         terminate: mock.Mock,
@@ -129,16 +149,16 @@ class RecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             popen.return_value.pid = 42
-            with mock.patch.object(wake_run, "preflight_codex_queue", return_value="/codex"):
+            with mock.patch.object(wake_launcher, "preflight_codex_queue", return_value="/codex"):
                 with self.assertRaisesRegex(RuntimeError, "bad status"):
-                    wake_run.arm_watcher(
+                    wake_launcher.arm_watcher(
                         thread_id="thread",
                         command="echo never",
                         cwd=directory,
                         log_dir=directory / "state",
                         codex_bin="codex",
                     )
-        terminate.assert_called_once_with(popen.return_value, timeout=wake_run.WORKER_STOP_TIMEOUT)
+        terminate.assert_called_once_with(popen.return_value, timeout=wake_launcher.WORKER_STOP_TIMEOUT)
 
     def test_wait_failure_after_startup_is_delivered_as_completion(self) -> None:
         process = mock.Mock(pid=321)
@@ -146,6 +166,12 @@ class RecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             startup = directory / "run.startup.json"
+            gate = directory / "run.gate.json"
+            wake_state.atomic_write_json(gate, {
+                "state": "committed",
+                "run_id": "run1",
+                "goal_guard": {"mode": "not_needed", "verified": True, "lease_id": None},
+            })
             with mock.patch.object(worker_runtime.subprocess, "Popen", return_value=process):
                 with mock.patch.object(worker_runtime, "terminate_process_tree") as terminate:
                     with mock.patch.object(wake_run, "queue_wakeup", side_effect=successful_queue):
@@ -157,6 +183,8 @@ class RecoveryTests(unittest.TestCase):
                             codex_bin="codex",
                             run_id="run1",
                             startup_file=startup,
+                            gate_file=gate,
+                            launcher_pid=os.getpid(),
                         )
                 terminate.assert_called_once_with(process)
             event = wake_state.read_json(directory / "run.completion.json")

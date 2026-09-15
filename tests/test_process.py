@@ -99,5 +99,19 @@ class ProcessTreeTests(unittest.TestCase):
                 parent.wait()
 
 
+class LayoutTests(unittest.TestCase):
+    def test_skill_layout_and_file_limits(self) -> None:
+        self.assertTrue((ROOT / "SKILL.md").is_file())
+        self.assertFalse((ROOT / ".codex-plugin").exists())
+        for path in [*SCRIPTS.glob("*.py"), *Path(__file__).parent.glob("test_*.py")]:
+            lines = len(path.read_text(encoding="utf-8").splitlines())
+            self.assertLessEqual(lines, 500, f"{path} has {lines} lines")
+
+    def test_runtime_waits_for_process_without_shell_true(self) -> None:
+        source = (SCRIPTS / "wake_run_worker.py").read_text(encoding="utf-8")
+        self.assertIn("process.wait()", source)
+        self.assertNotIn("shell=True", source)
+
+
 if __name__ == "__main__":
     unittest.main()

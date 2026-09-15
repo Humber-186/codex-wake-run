@@ -19,6 +19,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import wake_run_core as wake_run
+import wake_run_launcher as wake_launcher
 import wake_run_platform as wake_platform
 import wake_run_state as wake_state
 import wake_run_worker as worker_runtime
@@ -154,6 +155,14 @@ class CompletionStateTests(unittest.TestCase):
 
 class WorkerTests(unittest.TestCase):
     def run_with_successful_delivery(self, *, command: str, directory: Path, startup: bool = False) -> int:
+        startup_file = directory / "run.startup.json" if startup else None
+        gate_file = directory / "run.gate.json" if startup else None
+        if gate_file is not None:
+            wake_state.atomic_write_json(gate_file, {
+                "state": "committed",
+                "run_id": "run1",
+                "goal_guard": {"mode": "not_needed", "verified": True, "lease_id": None},
+            })
         with mock.patch.object(wake_run, "queue_wakeup", side_effect=successful_queue):
             return wake_run.run_worker(
                 thread_id="thread",
@@ -162,7 +171,9 @@ class WorkerTests(unittest.TestCase):
                 log_file=directory / "run.log",
                 codex_bin="codex",
                 run_id="run1",
-                startup_file=directory / "run.startup.json" if startup else None,
+                startup_file=startup_file,
+                gate_file=gate_file,
+                launcher_pid=os.getpid() if startup else None,
             )
 
     def test_worker_logs_exit_and_marks_delivered(self) -> None:
@@ -199,6 +210,12 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             startup = directory / "run.startup.json"
+            gate = directory / "run.gate.json"
+            wake_state.atomic_write_json(gate, {
+                "state": "committed",
+                "run_id": "run1",
+                "goal_guard": {"mode": "not_needed", "verified": True, "lease_id": None},
+            })
             with mock.patch.object(worker_runtime, "open_private_log", side_effect=PermissionError("denied")):
                 with mock.patch.object(wake_run, "deliver_completion") as deliver:
                     exit_code = wake_run.run_worker(
@@ -209,6 +226,8 @@ class WorkerTests(unittest.TestCase):
                         codex_bin="codex",
                         run_id="run1",
                         startup_file=startup,
+                        gate_file=gate,
+                        launcher_pid=os.getpid(),
                     )
             self.assertEqual(exit_code, wake_run.WORKER_STARTUP_FAILURE)
             self.assertEqual(wake_state.read_json(startup)["state"], "startup_failed")
@@ -265,23 +284,30 @@ class WorkerTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
-    @mock.patch.object(wake_run, "_wait_for_startup")
-    @mock.patch.object(wake_run.subprocess, "Popen")
+    @mock.patch.object(wake_launcher, "acquire_goal_guard")
+    @mock.patch.object(wake_launcher, "_wait_for_state")
+    @mock.patch.object(wake_launcher.subprocess, "Popen")
     def test_launcher_returns_armed_only_after_running(
-        self, popen: mock.Mock, wait: mock.Mock
+        self, popen: mock.Mock, wait: mock.Mock, acquire: mock.Mock
     ) -> None:
         popen.return_value.pid = 42
-        wait.return_value = {
-            "state": "running",
-            "run_id": "fixed-run-12",
-            "worker_pid": 42,
-            "process_pid": 84,
-        }
+        wait.side_effect = [
+            {"state": "prepared", "run_id": "fixed-run-12", "worker_pid": 42},
+            {
+                "state": "running", "run_id": "fixed-run-12",
+                "worker_pid": 42, "process_pid": 84,
+            },
+        ]
+        acquire.return_value = mock.Mock(
+            mode="not_needed", as_dict=lambda: {
+                "mode": "not_needed", "verified": True, "lease_id": None,
+            }
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(wake_run, "preflight_codex_queue", return_value="/resolved/codex"):
-                with mock.patch.object(wake_run.uuid, "uuid4") as uuid4:
+            with mock.patch.object(wake_launcher, "preflight_codex_queue", return_value="/resolved/codex"):
+                with mock.patch.object(wake_launcher.uuid, "uuid4") as uuid4:
                     uuid4.return_value.hex = "fixed-run-12-and-more"
-                    result = wake_run.arm_watcher(
+                    result = wake_launcher.arm_watcher(
                         thread_id="thread",
                         command="echo ok",
                         cwd=Path(tmp),
@@ -291,6 +317,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result["status"], "armed")
         self.assertEqual(result["process_pid"], 84)
         self.assertIn("--startup-file", popen.call_args.args[0])
+        self.assertIn("--gate-file", popen.call_args.args[0])
 
     def test_startup_failure_and_worker_exit_are_errors(self) -> None:
         worker = mock.Mock()
@@ -305,17 +332,19 @@ class LauncherTests(unittest.TestCase):
                 error="denied",
             )
             with self.assertRaisesRegex(RuntimeError, "denied"):
-                wake_run._wait_for_startup(worker, status_file, timeout=1)
+                wake_launcher._wait_for_state(worker, status_file, "running", timeout=1)
         worker.poll.return_value = 127
         with self.assertRaisesRegex(RuntimeError, "exit 127"):
-            wake_run._wait_for_startup(worker, Path("/missing/startup.json"), timeout=1)
+            wake_launcher._wait_for_state(worker, Path("/missing/startup.json"), "running", timeout=1)
 
     def test_startup_timeout_is_error(self) -> None:
         worker = mock.Mock()
         worker.poll.return_value = None
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "within 0s"):
-                wake_run._wait_for_startup(worker, Path(tmp) / "missing.json", timeout=0)
+                wake_launcher._wait_for_state(
+                    worker, Path(tmp) / "missing.json", "running", timeout=0
+                )
 
     def test_invalid_startup_timeout_is_explicit(self) -> None:
         with mock.patch.dict(os.environ, {"WAKE_RUN_STARTUP_TIMEOUT": "nan"}):
@@ -391,12 +420,13 @@ class IntegrationTests(unittest.TestCase):
             state_dir = directory / "state"
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
-                result = wake_run.arm_watcher(
+                result = wake_launcher.arm_watcher(
                     thread_id="thread",
                     command=python_shell_command("import time; time.sleep(0.05); print('done')"),
                     cwd=directory,
                     log_dir=state_dir,
                     codex_bin=str(fake_codex),
+                    goal_policy="ignore",
                 )
             self.assertEqual(result["status"], "armed")
             self.assertIsInstance(result["process_pid"], int)
@@ -411,7 +441,7 @@ class IntegrationTests(unittest.TestCase):
             directory = Path(tmp)
             fake_codex = self.create_fake_codex(directory)
             with self.assertRaisesRegex(RuntimeError, "does not exist or is not a directory"):
-                wake_run.arm_watcher(
+                wake_launcher.arm_watcher(
                     thread_id="thread",
                     command="echo never-started",
                     cwd=directory / "missing-cwd",
@@ -464,20 +494,6 @@ class IntegrationTests(unittest.TestCase):
                     codex_bin="codex",
                 )
             self.assertEqual(exit_code, 0)
-
-
-class LayoutTests(unittest.TestCase):
-    def test_skill_layout_and_file_limits(self) -> None:
-        self.assertTrue((ROOT / "SKILL.md").is_file())
-        self.assertFalse((ROOT / ".codex-plugin").exists())
-        for path in [*SCRIPTS.glob("*.py"), *Path(__file__).parent.glob("test_*.py")]:
-            lines = len(path.read_text(encoding="utf-8").splitlines())
-            self.assertLessEqual(lines, 500, f"{path} has {lines} lines")
-
-    def test_runtime_waits_for_process_without_shell_true(self) -> None:
-        source = (SCRIPTS / "wake_run_worker.py").read_text(encoding="utf-8")
-        self.assertIn("process.wait()", source)
-        self.assertNotIn("shell=True", source)
 
 
 if __name__ == "__main__":

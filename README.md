@@ -12,7 +12,7 @@
 
 Long experiments create an awkward choice inside an agent session: either the model sits in a polling loop burning turns while it waits, or you lose the thread of the original task and have to re-explain it later.
 
-wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher and performs a short startup handshake. It prints `status: armed` only after the monitored shell process starts and the watcher owns its eventual exit status, then the current turn ends. This does not prove that the underlying application initialized, acquired a license, or passed configuration checks. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event and uses `codex queue` to inject a wake-up message back into the same thread. You can also explicitly enable economical monitoring so a lower-cost model such as Luna triages execution events and, within narrow authorization, retries the exact same command.
+wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher, protects any active Codex Goal with a verified pause lease, and performs a two-phase startup handshake. It prints `status: armed` only after Goal protection is committed, the monitored shell process starts, and the watcher owns its eventual exit status, then the current turn ends. This does not prove that the underlying application initialized, acquired a license, or passed configuration checks. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher persists a completion event, uses `codex queue` to inject a wake-up message back into the same thread, and only then conditionally restores the Goal. You can also explicitly enable economical monitoring so a lower-cost model such as Luna triages execution events and, within narrow authorization, retries the exact same command.
 
 ## Highlights
 
@@ -20,6 +20,7 @@ wake-run removes the wait. You hand it the finalized command; it spawns a detach
 |---|---|
 | Event-driven long jobs | The watcher blocks on `process.wait()`; only the bounded startup handshake checks a status file. |
 | Strict startup confirmation | `armed` is returned only after the worker reports the monitored shell PID. Startup failure and timeout are explicit errors. |
+| Active Goal protection | A durable, shared lease pauses and verifies an active Goal before target startup; wake delivery succeeds before conditional restoration. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job. |
 | Failures stay visible | Non-zero command exits wake the thread; worker or target startup failures fail synchronously before `armed`. |
 | Windows and POSIX paths | Commands run through PowerShell on Windows and `bash -o pipefail` on POSIX, including `codex.ps1` shim handling. CI defines both platforms; release confidence depends on actual Actions results. |
@@ -55,7 +56,7 @@ exit code + log
 Codex thread wakes and continues
 ```
 
-The launcher verifies `codex queue` support before it starts anything, so an incompatible Codex CLI fails fast instead of running your job and then failing to wake anyone.
+The launcher verifies `codex queue` and the App Server Goal methods before it starts the target, so an incompatible Codex CLI fails fast instead of running the job in a falsely armed state.
 
 ## Usage Example
 
@@ -68,7 +69,7 @@ Use the wake-run skill to run this experiment and continue after it exits.
 **Codex** launches the job and gets `armed` back:
 
 ```json
-{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log"}
+{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "..."}}
 ```
 
 It then ends the turn. Nothing polls the job.
@@ -96,6 +97,8 @@ Wake delivery is at-least-once. Retries reuse the same `wake_id`, so duplicate m
 ```bash
 python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <run-state-dir>
 ```
+
+Goal protection defaults to `--goal-policy auto`. `require` rejects launch unless the thread has an active Goal. `ignore` explicitly disables protection and should be used only when Goal continuation during the wait is acceptable. Completion JSON tracks wake delivery and Goal release independently, so replay never reruns the target or duplicates a successfully queued wake merely to retry Goal restoration.
 
 ## Economical Monitoring
 
@@ -145,7 +148,8 @@ Use the wake-run skill to run xxx for me.
 A few things worth knowing:
 
 - **It only works inside a Codex session.** The Skill needs `CODEX_THREAD_ID` to know which thread to wake.
-- **Your Codex CLI needs `codex queue`.** The launcher preflights this before starting the experiment.
+- **Your Codex CLI needs `codex queue` and App Server Goal methods.** The launcher preflights queue support and verifies Goal reads/writes before target startup. `--goal-policy ignore` is an explicit opt-out.
+- **Goal RPCs are bounded and visible.** `WAKE_RUN_GOAL_TIMEOUT` defaults to 10 seconds and must be a finite positive value; timeout or protocol errors fail launch instead of degrading silently.
 - **Economical monitoring also needs persistent `codex exec` sessions, structured output, and `codex exec resume`.** Its explicit `WAKE_RUN_MONITOR_TIMEOUT` defaults to 300 seconds.
 - **It is not a way around your sandbox.** The background process inherits the launch environment and its permissions.
 - **One watcher per experiment.** Multiple watchers are fine when the task genuinely requires parallel jobs.
@@ -156,7 +160,10 @@ A few things worth knowing:
 |---|---|
 | [`SKILL.md`](./SKILL.md) | Skill instructions: launch workflow, runtime contract, and wake-up message shape. |
 | [`scripts/wake_run.py`](./scripts/wake_run.py) | Command-line entrypoint. |
-| [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Startup handshake, wake delivery, and replay. |
+| [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | Wake delivery, Goal release ordering, and replay. |
+| [`scripts/wake_run_app_server.py`](./scripts/wake_run_app_server.py) | Bounded JSONL client for stable Codex App Server RPC. |
+| [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Shared Goal leases, verification, conflict handling, and recovery. |
+| [`scripts/wake_run_launcher.py`](./scripts/wake_run_launcher.py) | Two-phase supervisor and target startup. |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | Monitor plans, Codex sessions, structured triage, and recursion prevention. |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | Target-process execution and completion persistence. |
 | [`scripts/wake_run_metrics.py`](./scripts/wake_run_metrics.py) | Wall-clock and CPU timing metrics. |

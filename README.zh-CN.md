@@ -12,7 +12,7 @@
 
 在 agent 会话里跑长实验，通常只有两种难受的选择：要么让模型停在轮询循环里，一轮一轮地等；要么放弃这条线程，等结果出来之后重新把任务背景讲一遍。
 
-wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启动一个分离的守护进程并完成短暂的启动握手；监控用 shell 进程成功启动、后续退出状态已由 watcher 接管后，才打印 `status: armed`，随后当前轮次结束。这不代表底层应用已经完成初始化、取得许可证或通过配置检查。守护进程阻塞在操作系统的进程退出事件上。命令结束时，无论成功还是失败，守护进程都会先持久化完成事件，再用 `codex queue` 把唤醒消息注入原线程。也可以显式启用经济看护，让 Luna 等低成本模型只在执行事件发生后分诊结果，并在有限授权下重试完全相同的命令。
+wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启动一个分离的守护进程，以可验证的暂停租约保护当前 active Goal，并完成两阶段启动握手；只有 Goal 保护已提交、监控用 shell 进程成功启动且后续退出状态已由 watcher 接管后，才打印 `status: armed`，随后当前轮次结束。这不代表底层应用已经完成初始化、取得许可证或通过配置检查。守护进程阻塞在操作系统的进程退出事件上。命令结束时，无论成功还是失败，守护进程都会先持久化完成事件，再用 `codex queue` 把唤醒消息注入原线程，最后有条件地恢复 Goal。也可以显式启用经济看护，让 Luna 等低成本模型只在执行事件发生后分诊结果，并在有限授权下重试完全相同的命令。
 
 ## 核心特性
 
@@ -20,6 +20,7 @@ wake-run 把这段等待去掉。你把已经定稿的命令交给它，它启�
 |---|---|
 | 长任务事件驱动 | 守护进程阻塞在 `process.wait()` 上；只有有界的启动握手会检查状态文件。 |
 | 严格启动确认 | worker 报告监控用 shell 进程 PID 后才返回 `armed`；启动失败和超时都会明确报错。 |
+| active Goal 保护 | 目标启动前用持久化共享租约暂停并验证 Goal；完成消息成功入队后才有条件恢复。 |
 | 唤醒同一条线程 | 守护进程调用 `codex queue --thread "$CODEX_THREAD_ID"`，续跑消息回到发起任务的那次对话。 |
 | 失败始终可见 | 命令非零退出会唤醒线程；worker 或目标进程启动失败会在返回 `armed` 前同步报错。 |
 | Windows 与 POSIX 路径 | Windows 走 PowerShell，POSIX 走 `bash -o pipefail`，并处理 `codex.ps1` shim；仓库 CI 定义双平台测试，发布可靠性以实际 Actions 结果为准。 |
@@ -55,7 +56,7 @@ wake_run.py launcher
 Codex 被唤醒并继续原任务
 ```
 
-启动器在执行实验之前先验证 `codex queue` 是否可用。这样，不兼容的 Codex CLI 会立刻报错，而不是任务跑完后才发现无法唤醒。
+启动器在目标启动前验证 `codex queue` 与 App Server Goal 接口。这样，不兼容的 Codex CLI 会立刻报错，不会让任务处于虚假的 `armed` 状态。
 
 ## 使用示例
 
@@ -68,7 +69,7 @@ Codex 被唤醒并继续原任务
 **Codex** 启动任务并拿到 `armed`：
 
 ```json
-{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log"}
+{"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "process_pid": 97154, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log", "goal_guard": {"mode": "paused", "verified": true, "lease_id": "..."}}
 ```
 
 随后当前轮次结束，不会轮询后台任务。
@@ -96,6 +97,8 @@ Codex 在收到 `armed` 后只发送一条简短确认并结束当前轮次；�
 ```bash
 python <skill-dir>/scripts/wake_run.py --replay-pending --log-dir <运行状态目录>
 ```
+
+Goal 保护默认使用 `--goal-policy auto`。`require` 会在当前线程没有 active Goal 时拒绝启动；`ignore` 会显式禁用保护，只应在可以接受等待期间 Goal 自动续跑时使用。completion JSON 分别跟踪唤醒投递和 Goal 释放，因此只重试恢复 Goal 时不会重新运行目标，也不会重复已经成功入队的唤醒消息。
 
 ## 经济看护
 
@@ -145,7 +148,8 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 几件值得知道的事：
 
 - **只能在 Codex 会话内工作。** Skill 依赖 `CODEX_THREAD_ID` 判断应该唤醒哪条线程。
-- **Codex CLI 需要支持 `codex queue`。** 启动器会在实验启动前预检。
+- **Codex CLI 需要支持 `codex queue` 与 App Server Goal 接口。** 启动器会预检 queue，并在目标启动前读回验证 Goal。`--goal-policy ignore` 是显式退出保护。
+- **Goal RPC 有明确时限且失败可见。** `WAKE_RUN_GOAL_TIMEOUT` 默认 10 秒，必须为有限正数；超时或协议错误会让启动失败，不会静默降级。
 - **经济看护还需要持久 `codex exec` 会话、结构化输出和 `codex exec resume`。** 监护调用超时由显式的 `WAKE_RUN_MONITOR_TIMEOUT` 控制，默认 300 秒。
 - **它不是绕过沙箱的手段。** 后台进程继承启动环境及其权限。
 - **每个实验一个 watcher。** 任务确实需要时可以并行运行多个。
@@ -156,7 +160,10 @@ launcher 会在目标进程启动前创建并确认独立的只读 Codex 会话�
 |---|---|
 | [`SKILL.md`](./SKILL.md) | Skill 指令：启动流程、运行时约定、唤醒消息结构。 |
 | [`scripts/wake_run.py`](./scripts/wake_run.py) | 命令行入口。 |
-| [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | 启动握手、唤醒投递与补发。 |
+| [`scripts/wake_run_core.py`](./scripts/wake_run_core.py) | 唤醒投递、Goal 释放顺序与补发。 |
+| [`scripts/wake_run_app_server.py`](./scripts/wake_run_app_server.py) | 有界的 Codex App Server JSONL 客户端。 |
+| [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Goal 共享租约、验证、冲突处理与恢复。 |
+| [`scripts/wake_run_launcher.py`](./scripts/wake_run_launcher.py) | 两阶段 supervisor 与目标启动。 |
 | [`scripts/wake_run_monitor.py`](./scripts/wake_run_monitor.py) | 监护计划、Codex 会话、结构化分诊与递归防护。 |
 | [`scripts/wake_run_worker.py`](./scripts/wake_run_worker.py) | 目标进程执行与完成事件持久化。 |
 | [`scripts/wake_run_metrics.py`](./scripts/wake_run_metrics.py) | 墙钟与 CPU 耗时统计。 |

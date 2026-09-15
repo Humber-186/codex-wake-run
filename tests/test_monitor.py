@@ -19,6 +19,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import wake_run_core as wake_run
+import wake_run_launcher as wake_launcher
 import wake_run_monitor as monitor
 import wake_run_state as wake_state
 import wake_run_worker as worker
@@ -405,13 +406,14 @@ raise SystemExit(2)
             policy = monitor.load_monitor_policy(write_policy(directory))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
-                armed = wake_run.arm_watcher(
+                armed = wake_launcher.arm_watcher(
                     thread_id="root-thread",
                     command=python_shell_command("print('done')"),
                     cwd=directory,
                     log_dir=directory / "state",
                     codex_bin=str(fake),
                     monitor_policy=policy,
+                    goal_policy="ignore",
                 )
             completion = Path(str(armed["log_file"])).with_suffix(".completion.json")
             event = self.wait_for_completion(completion)
@@ -424,8 +426,8 @@ raise SystemExit(2)
         self.assertIn("exit_code: 0", wake_message)
         self.assertRegex(wake_message, r"wall：\d+\.\d{3}s\nuser：\d+\.\d{3}s\nsys：\d+\.\d{3}s")
 
-    @mock.patch.object(wake_run.subprocess, "Popen")
-    @mock.patch.object(wake_run, "create_monitor_session", side_effect=RuntimeError("monitor denied"))
+    @mock.patch.object(wake_launcher.subprocess, "Popen")
+    @mock.patch.object(wake_launcher, "create_monitor_session", side_effect=RuntimeError("monitor denied"))
     def test_monitor_creation_failure_prevents_target_start(
         self,
         _create: mock.Mock,
@@ -434,9 +436,9 @@ raise SystemExit(2)
         policy = monitor.MonitorPolicy("gpt-5.6-luna", "escalate", (), 0, 1024)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            with mock.patch.object(wake_run, "preflight_codex_queue", return_value="/codex"):
+            with mock.patch.object(wake_launcher, "preflight_codex_queue", return_value="/codex"):
                 with self.assertRaisesRegex(RuntimeError, "monitor denied"):
-                    wake_run.arm_watcher(
+                    wake_launcher.arm_watcher(
                         thread_id="root",
                         command="echo never",
                         cwd=directory,
