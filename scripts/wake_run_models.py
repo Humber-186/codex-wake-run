@@ -31,7 +31,7 @@ class ExecutionResult:
     user_seconds: float | None = None
     system_seconds: float | None = None
     terminal_state: str = "completed"
-    stage_delivery_error: str | None = None
+    stage_delivery: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

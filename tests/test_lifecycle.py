@@ -208,6 +208,9 @@ class LifecycleIntegrationTests(unittest.TestCase):
             if time.monotonic() >= deadline:
                 self.fail("terminal event was not delivered")
             time.sleep(POLL_SECONDS)
+        completion_event = state.read_json(completion)
+        self.assertEqual(completion_event["stage_delivery"]["delivered"], 2)
+        self.assertEqual(completion_event["stage_delivery"]["pending"], 0)
         messages = [json.loads(line)[4] for line in self.capture.read_text().splitlines() if "--message" in line]
         self.assertEqual(sum("[后台任务阶段-系统提示]" in item for item in messages), 2)
         self.assertEqual(sum("[后台任务完成-系统提示]" in item for item in messages), 1)
@@ -225,6 +228,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.environment):
             ack = control.issue_control(str(armed["run_id"]), "detach", thread_id="thread1")
         self.assertEqual(ack["status"], "detached")
+        self.assertEqual(ack["stage_delivery"]["pending"], 0)
         run = self.wait_for_state(str(armed["run_id"]), "detached")
         self.assertTrue(run["target_alive"])
         self.assertFalse(Path(str(armed["log_file"])).with_suffix(".completion.json").exists())

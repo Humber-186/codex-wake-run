@@ -56,6 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--startup-file", help=argparse.SUPPRESS)
     parser.add_argument("--gate-file", help=argparse.SUPPRESS)
     parser.add_argument("--launcher-pid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--attempt-id", help=argparse.SUPPRESS)
     parser.add_argument("--monitor-plan-file", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-file", help=argparse.SUPPRESS)
     parser.add_argument("--stage-plan-file", help=argparse.SUPPRESS)
@@ -105,14 +106,17 @@ def _handle_nonlaunch_action(args: argparse.Namespace) -> int | None:
         return 0
     if args.adopt_worker:
         required = (args.spec_file, args.runtime_file, args.startup_file, args.gate_file)
-        if not all(required) or not args.launcher_pid:
-            raise SystemExit("adopt worker mode requires spec/runtime/startup/gate files and launcher pid")
+        if not all(required) or not args.launcher_pid or not args.attempt_id:
+            raise SystemExit(
+                "adopt worker mode requires spec/runtime/startup/gate files, launcher pid, and attempt id"
+            )
         return run_adopted_worker(
             spec_file=Path(str(args.spec_file)).expanduser().resolve(),
             runtime_file=Path(str(args.runtime_file)).expanduser().resolve(),
             startup_file=Path(str(args.startup_file)).expanduser().resolve(),
             gate_file=Path(str(args.gate_file)).expanduser().resolve(),
             launcher_pid=args.launcher_pid,
+            attempt_id=args.attempt_id,
             codex_bin=args.codex_bin,
             deliver_stage=deliver_stage_event,
             deliver_completion=deliver_completion,

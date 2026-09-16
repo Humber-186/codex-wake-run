@@ -144,6 +144,7 @@ def create_completion_event(
     goal_guard: dict[str, object] | None = None,
     terminal_state: str = "completed",
     observer_mode: str = "owned",
+    stage_delivery: dict[str, object] | None = None,
 ) -> Path:
     guard = goal_guard or {"mode": "not_needed", "verified": True, "lease_id": None}
     release_state = (
@@ -164,7 +165,14 @@ def create_completion_event(
         "completed_at": utc_now(),
         "terminal_state": terminal_state,
         "observer_mode": observer_mode,
-        "exact_exit_code_available": observer_mode != "adopted",
+        "exact_exit_code_available": observer_mode != "adopted" and exit_code is not None,
+        "stage_delivery": stage_delivery or {
+            "total": 0,
+            "delivered": 0,
+            "pending": 0,
+            "failed": 0,
+            "last_error": None,
+        },
         "wake_id": wake_id,
         "log_file": str(log_file),
         "execution_attempts": execution_attempts or [],
@@ -221,6 +229,13 @@ def update_delivery(
         "delivery_pid": os.getpid() if state == DELIVERY_IN_PROGRESS else None,
     }
     atomic_write_json(path, {**payload, "delivery": delivery})
+
+
+def update_stage_delivery(path: Path, stage_delivery: dict[str, object]) -> None:
+    payload = read_json(path)
+    if payload.get("event_type") != "process_exit":
+        raise RuntimeError(f"Not a completion event: {path}")
+    atomic_write_json(path, {**payload, "stage_delivery": stage_delivery})
 
 
 def update_goal_release(

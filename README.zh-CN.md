@@ -125,7 +125,7 @@ python3 <skill-dir>/scripts/wake_run.py \
   --stage-plan /absolute/path/stages.json
 ```
 
-只有完整日志行会参与匹配，且只检查下一个未完成阶段。每个阶段事件先持久化再投递，使用稳定的 `wake_id`；阶段唤醒不释放 Goal。进程退出后仍生成终态事件。第一版刻意不加入任意脚本条件、持续模型判断、elapsed 或 idle 猜测。
+只有完整日志行会参与匹配，只检查下一个未完成阶段，且一行最多推进一个阶段。一次扫描发现的所有事件会先全部持久化，再推进 runtime checkpoint，最后提交投递；事件和终态 checkpoint 立即落盘，普通 offset-only checkpoint 则按 5 秒或 1 MiB 节流。阶段投递默认只短暂重试 20 秒（`WAKE_RUN_STAGE_QUEUE_TIMEOUT`）；进程退出时至多等待当前正在进行的投递，尚未开始的事件保留为 pending 交给 replay，失败与 pending 数量写入最终 completion。阶段事件使用稳定的 `wake_id`，不释放 Goal；退出观察在这段有界等待前持久化。第一版刻意不加入任意脚本条件、持续模型判断、elapsed 或 idle 猜测。
 
 ### 运行控制与恢复
 
@@ -135,7 +135,7 @@ python <skill-dir>/scripts/wake_run.py --detach <run_id>
 python <skill-dir>/scripts/wake_run.py --adopt <run_id>
 ```
 
-`stop` 对目标进程树执行 TERM/KILL 收口，并产生 `cancelled` 终态唤醒。`detach` 先释放该 Run 的 Goal holder，再结束 worker；目标进程继续运行，不再保证退出码或最终通知。`adopt` 只用于原 worker 已死而目标仍活着的恢复路径：它用 Linux boot ID 与 `/proc/<pid>/stat` starttime 排除 PID 复用，继续未完成的阶段观察；由于新 observer 不是目标父进程，最终消息会明确给出 `observer_mode: adopted` 和 `exact_exit_code_available: false`。健康 Run 不允许 adopt。
+`stop` 对目标进程树执行 TERM/KILL 收口，并产生 `cancelled` 终态唤醒。`detach` 会先排空已持久化阶段事件的短时投递尝试并报告汇总，再释放该 Run 的 Goal holder、结束 worker；目标进程继续运行，不再保证退出码或最终通知。控制命令已经持久化但 15 秒内尚未收到 worker 确认时，会返回 `status: pending`，而不是误报失败。`adopt` 只用于原 worker 已死而目标仍活着的恢复路径：每次尝试使用唯一握手 ID 和 Run 级锁，转交失败会回滚 Goal holder；它用 Linux boot ID 与 `/proc/<pid>/stat` starttime 排除 PID 复用，继续未完成的阶段观察，gate 后目标退出则正常落为 `observed_exit`。由于新 observer 不是目标父进程，最终消息会明确给出 `observer_mode: adopted` 和 `exact_exit_code_available: false`。健康 Run 不允许 adopt。
 
 `wall` 是墙钟耗时；`user` 和 `sys` 分别是用户态与内核态 CPU 耗时。Windows 下无法可靠统计整棵进程树的 CPU 时间，因此省略 `user` 和 `sys`，不会使用 PowerShell 宿主进程的不完整数据。
 
@@ -216,6 +216,7 @@ launcher 会在目标进程启动前验证 `codex exec`/`resume` 能力并持久
 | [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Goal 共享租约、验证、冲突处理与恢复。 |
 | [`scripts/wake_run_goal_state.py`](./scripts/wake_run_goal_state.py) | Goal lease schema 与 holder 阶段。 |
 | [`scripts/wake_run_stages.py`](./scripts/wake_run_stages.py) | 阶段计划校验与增量日志匹配。 |
+| [`scripts/wake_run_stage_commit.py`](./scripts/wake_run_stage_commit.py) | event 先于 checkpoint 的持久提交与 checkpoint 节流。 |
 | [`scripts/wake_run_supervisor.py`](./scripts/wake_run_supervisor.py) | 运行期阶段扫描、投递队列与控制命令。 |
 | [`scripts/wake_run_control.py`](./scripts/wake_run_control.py) | `stop` / `detach` 命令与确认通道。 |
 | [`scripts/wake_run_adopt.py`](./scripts/wake_run_adopt.py) | Linux 恢复 observer 的验证与启动。 |
@@ -235,6 +236,7 @@ launcher 会在目标进程启动前验证 `codex exec`/`resume` 能力并持久
 | [`tests/test_process.py`](./tests/test_process.py) | POSIX 与 Windows 进程树清理测试。 |
 | [`tests/test_goal_worker.py`](./tests/test_goal_worker.py) | Goal 启动窗口、orphan 与阻塞锁测试。 |
 | [`tests/test_lifecycle.py`](./tests/test_lifecycle.py) | 多阶段、stop、detach、adopt 与补发集成测试。 |
+| [`tests/test_reliability_review.py`](./tests/test_reliability_review.py) | 崩溃窗口、投递顺序、控制超时与状态报告回归测试。 |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | 经济看护计划与决策契约。 |
 
 运行日志默认写入启动任务所在项目的 `.codex-wake-run/` 目录。仓库自身会忽略该目录，但宿主项目不会自动继承本仓库的 `.gitignore`；请在宿主项目中自行加入 `.codex-wake-run/`。大型 EDA 项目可通过 `--log-dir ~/.codex/wake-run/<project>` 把高频状态写入本地磁盘，避免源码仓库或 NFS 路径。

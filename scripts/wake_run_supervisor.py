@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Callable
 
 from wake_run_control import acknowledge_control, pending_controls
-from wake_run_events import create_stage_event, delivered_stage_ids
+from wake_run_events import persisted_stage_state, stage_delivery_summary
 from wake_run_goal import GoalGuardContext, cancel_goal_guard
 from wake_run_models import WorkerRequest
 from wake_run_process import terminate_process_tree
 from wake_run_registry import write_run_runtime
-from wake_run_stages import StageMatch, StageScanner, load_stage_plan
+from wake_run_stage_commit import StageCommitContext, StageCommitter
+from wake_run_stages import StageScanner, load_stage_plan
 
 SUPERVISOR_INTERVAL_SECONDS = 0.2
 StageDelivery = Callable[[Path, str], None]
@@ -28,15 +29,25 @@ class StageDeliveryPump:
         self._codex_bin = codex_bin
         self._queue: queue.Queue[Path | None] = queue.Queue()
         self.errors: list[str] = []
+        self._closed = False
+        self._stop_after_current = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def submit(self, path: Path) -> None:
         self._queue.put(path)
 
-    def close(self) -> None:
+    def close(self, *, wait: bool, drain: bool = True) -> None:
+        if self._closed:
+            if wait:
+                self._thread.join()
+            return
+        self._closed = True
+        if not drain:
+            self._stop_after_current.set()
         self._queue.put(None)
-        self._thread.join()
+        if wait:
+            self._thread.join()
 
     def _run(self) -> None:
         while True:
@@ -44,6 +55,8 @@ class StageDeliveryPump:
             try:
                 if path is None:
                     return
+                if self._stop_after_current.is_set():
+                    continue
                 self._deliver(path, self._codex_bin)
             except Exception as error:
                 assert path is not None
@@ -60,12 +73,23 @@ def supervise_owned_process(
     goal_guard: dict[str, object],
     deliver_stage: StageDelivery,
     wait_process: WaitProcess,
-) -> tuple[int | None, str, str | None]:
+) -> tuple[int | None, str, dict[str, object]]:
     scanner = _scanner(request, initial_log_offset)
     pump = StageDeliveryPump(deliver_stage, request.codex_bin)
+    committer = StageCommitter(
+        StageCommitContext(
+            run_id=request.run_id,
+            thread_id=request.thread_id,
+            command=request.command,
+            log_file=request.log_file,
+            runtime_file=request.runtime_file,
+        ),
+        scanner,
+        pump.submit,
+    )
     wait_done, wait_result = _start_waiter(process, wait_process)
     while True:
-        _scan_stages(request, scanner, pump, final=False)
+        committer.scan(final=False)
         if wait_done.is_set():
             error = wait_result.get("error")
             if isinstance(error, Exception):
@@ -73,18 +97,24 @@ def supervise_owned_process(
             return_code = wait_result.get("exit_code")
             if not isinstance(return_code, int):
                 raise RuntimeError("Process waiter returned no exit code")
-            _scan_stages(request, scanner, pump, final=True)
-            pump.close()
-            delivery_error = "; ".join(pump.errors) if pump.errors else None
-            return return_code, "completed", delivery_error
-        action = _handle_controls(request, process, goal_guard)
+            committer.scan(final=True)
+            _record_exit_observation(request, return_code, "completed")
+            pump.close(wait=True, drain=False)
+            return return_code, "completed", stage_delivery_summary(
+                request.log_file, delivery_errors=pump.errors
+            )
+        action = _handle_controls(request, process, goal_guard, pump=pump)
         if action == "detached":
-            return None, action, None
+            return None, action, stage_delivery_summary(
+                request.log_file, delivery_errors=pump.errors
+            )
         if action == "cancelled":
-            _scan_stages(request, scanner, pump, final=True)
-            pump.close()
-            error = "; ".join(pump.errors) if pump.errors else None
-            return process.returncode, action, error
+            committer.scan(final=True)
+            _record_exit_observation(request, process.returncode, action)
+            pump.close(wait=True, drain=False)
+            return process.returncode, action, stage_delivery_summary(
+                request.log_file, delivery_errors=pump.errors
+            )
         time.sleep(SUPERVISOR_INTERVAL_SECONDS)
 
 
@@ -111,7 +141,7 @@ def _scanner(request: WorkerRequest, initial_offset: int) -> StageScanner | None
     if request.stage_plan_file is None:
         return None
     rules = load_stage_plan(request.stage_plan_file)
-    completed = delivered_stage_ids(request.log_file)
+    completed, event_offset = persisted_stage_state(request.log_file)
     offset = initial_offset
     if request.runtime_file is not None and request.runtime_file.exists():
         from wake_run_state import read_json
@@ -120,68 +150,15 @@ def _scanner(request: WorkerRequest, initial_offset: int) -> StageScanner | None
         value = runtime.get("log_offset")
         if isinstance(value, int) and value >= initial_offset:
             offset = value
-    return StageScanner(rules, completed=completed, offset=offset)
-
-
-def _scan_stages(
-    request: WorkerRequest,
-    scanner: StageScanner | None,
-    pump: StageDeliveryPump,
-    *,
-    final: bool,
-) -> None:
-    if scanner is None:
-        return
-    prior_offset = scanner.offset
-    prior_count = len(scanner.completed)
-    for match in scanner.scan(request.log_file, final=final):
-        event_file = _persist_match(request, scanner, match)
-        pump.submit(event_file)
-    if scanner.offset != prior_offset and len(scanner.completed) == prior_count:
-        _record_stage_runtime(request, scanner, None)
-
-
-def _persist_match(request: WorkerRequest, scanner: StageScanner, match: StageMatch) -> Path:
-    sequence = scanner.completed.index(match.stage_id) + 1
-    event_file = create_stage_event(
-        request.log_file,
-        sequence=sequence,
-        run_id=request.run_id,
-        thread_id=request.thread_id,
-        command=request.command,
-        stage_id=match.stage_id,
-        matched_line=match.line,
-        log_offset=match.log_offset,
-    )
-    _record_stage_runtime(request, scanner, {
-        "type": "stage",
-        "stage_id": match.stage_id,
-        "event_file": str(event_file),
-    })
-    return event_file
-
-
-def _record_stage_runtime(
-    request: WorkerRequest,
-    scanner: StageScanner,
-    last_event: dict[str, object] | None,
-) -> None:
-    if request.runtime_file is None:
-        return
-    write_run_runtime(
-        request.runtime_file,
-        run_id=request.run_id,
-        state="running",
-        log_offset=scanner.offset,
-        completed_stages=list(scanner.completed),
-        last_event=last_event,
-    )
+    return StageScanner(rules, completed=completed, offset=max(offset, event_offset))
 
 
 def _handle_controls(
     request: WorkerRequest,
     process: subprocess.Popen[bytes],
     goal_guard: dict[str, object],
+    *,
+    pump: StageDeliveryPump,
 ) -> str | None:
     controls = pending_controls(request.log_file)
     if not controls:
@@ -193,9 +170,21 @@ def _handle_controls(
             terminate_process_tree(process)
             result = "cancelled"
         else:
+            pump.close(wait=True)
             _detach_goal(request, goal_guard)
             result = "detached"
-        acknowledge_control(request.log_file, command_file, command, status=result)
+        delivery = (
+            stage_delivery_summary(request.log_file, delivery_errors=pump.errors)
+            if result == "detached"
+            else None
+        )
+        acknowledge_control(
+            request.log_file,
+            command_file,
+            command,
+            status=result,
+            stage_delivery=delivery,
+        )
         _record_terminal_runtime(request, result)
         return result
     except Exception as error:
@@ -228,4 +217,20 @@ def _record_terminal_runtime(request: WorkerRequest, state: str) -> None:
         run_id=request.run_id,
         state=state,
         last_event={"type": state},
+    )
+
+
+def _record_exit_observation(
+    request: WorkerRequest,
+    exit_code: int | None,
+    terminal_state: str,
+) -> None:
+    if request.runtime_file is None:
+        return
+    write_run_runtime(
+        request.runtime_file,
+        run_id=request.run_id,
+        state="reviewing",
+        exit_code=exit_code,
+        last_event={"type": "process_exit", "terminal_state": terminal_state},
     )

@@ -53,6 +53,8 @@ from wake_run_events import event_is_delivered, stage_event_files
 
 QUEUE_CALL_TIMEOUT, QUEUE_TOTAL_TIMEOUT = 30, 1800
 QUEUE_RETRY_DELAYS = (1, 2, 5, 10, 30, 60)
+STAGE_QUEUE_CALL_TIMEOUT, STAGE_QUEUE_TOTAL_TIMEOUT = 5, 20
+STAGE_QUEUE_RETRY_DELAYS = (1, 2, 5)
 PREFLIGHT_TIMEOUT, STARTUP_WAIT_TIMEOUT = 30, 10
 
 AttemptHook = Callable[[int], None]
@@ -71,6 +73,15 @@ class QueuePolicy:
         if not math.isfinite(total) or total <= 0:
             raise RuntimeError("WAKE_RUN_QUEUE_TIMEOUT must be a finite number greater than zero")
         return cls(QUEUE_CALL_TIMEOUT, total, QUEUE_RETRY_DELAYS)
+
+    @classmethod
+    def for_stage(cls) -> "QueuePolicy":
+        total = float(os.environ.get("WAKE_RUN_STAGE_QUEUE_TIMEOUT", STAGE_QUEUE_TOTAL_TIMEOUT))
+        if not math.isfinite(total) or total <= 0:
+            raise RuntimeError(
+                "WAKE_RUN_STAGE_QUEUE_TIMEOUT must be a finite number greater than zero"
+            )
+        return cls(STAGE_QUEUE_CALL_TIMEOUT, total, STAGE_QUEUE_RETRY_DELAYS)
 
 
 def startup_timeout_from_environment() -> float:
@@ -201,6 +212,9 @@ def _event_message(event: dict[str, object]) -> str:
         monitor=event.get("monitor") if isinstance(event.get("monitor"), dict) else None,
         terminal_state=str(event.get("terminal_state", "completed")),
         observer_mode=str(event.get("observer_mode", "owned")),
+        stage_delivery=(
+            event.get("stage_delivery") if isinstance(event.get("stage_delivery"), dict) else None
+        ),
     )
 
 
@@ -211,7 +225,12 @@ def deliver_completion(completion_file: Path, codex_bin: str) -> None:
         if not isinstance(delivery, dict):
             raise RuntimeError(f"Missing delivery state in {completion_file}")
         if delivery.get("state") != DELIVERY_DELIVERED:
-            _deliver_wake_event(completion_file, codex_bin, event, delivery)
+            _deliver_wake_event(
+                completion_file,
+                codex_bin,
+                event=event,
+                delivery=delivery,
+            )
             event = read_json(completion_file)
         _release_event_goal(completion_file, codex_bin, event)
 
@@ -225,14 +244,22 @@ def deliver_stage_event(event_file: Path, codex_bin: str) -> None:
         if not isinstance(delivery, dict):
             raise RuntimeError(f"Missing delivery state in {event_file}")
         if delivery.get("state") != DELIVERY_DELIVERED:
-            _deliver_wake_event(event_file, codex_bin, event, delivery)
+            _deliver_wake_event(
+                event_file,
+                codex_bin,
+                event=event,
+                delivery=delivery,
+                policy=QueuePolicy.for_stage(),
+            )
 
 
 def _deliver_wake_event(
     completion_file: Path,
     codex_bin: str,
+    *,
     event: dict[str, object],
     delivery: dict[str, object],
+    policy: QueuePolicy | None = None,
 ) -> None:
     prior_attempts = delivery.get("attempts")
     if not isinstance(prior_attempts, int) or prior_attempts < 0:
@@ -258,6 +285,7 @@ def _deliver_wake_event(
         str(event["thread_id"]),
         _event_message(event),
         codex_bin,
+        policy=policy,
         before_attempt=before_attempt,
         after_failure=after_failure,
     )

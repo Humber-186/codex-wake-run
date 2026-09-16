@@ -13,6 +13,7 @@ CONTROL_SCHEMA_VERSION = 1
 CONTROL_WAIT_SECONDS = 15
 CONTROL_POLL_SECONDS = 0.05
 CONTROL_ACTIONS = frozenset({"stop", "detach"})
+CONTROLLABLE_STATES = frozenset({"running", "reviewing"})
 
 
 def control_paths(log_file: Path) -> tuple[Path, Path]:
@@ -28,7 +29,7 @@ def issue_control(run_id: str, action: str, *, thread_id: str) -> dict[str, obje
     _spec_file, spec, _runtime_file, runtime = load_run_record(run_id)
     if spec.get("owner_thread_id") != thread_id:
         raise RuntimeError(f"Run {run_id} is owned by another Codex thread")
-    if runtime.get("state") != "running":
+    if runtime.get("state") not in CONTROLLABLE_STATES:
         raise RuntimeError(f"Run {run_id} is not controllable in state {runtime.get('state')}")
     worker_pid = runtime.get("worker_pid")
     if not isinstance(worker_pid, int) or not process_is_alive(worker_pid):
@@ -45,7 +46,12 @@ def issue_control(run_id: str, action: str, *, thread_id: str) -> dict[str, obje
         "action": action,
         "created_at": utc_now(),
     })
-    return _wait_for_ack(ack_file, run_id=run_id, action=action)
+    return _wait_for_ack(
+        ack_file,
+        command_id=command_id,
+        run_id=run_id,
+        action=action,
+    )
 
 
 def pending_controls(log_file: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
@@ -67,6 +73,7 @@ def acknowledge_control(
     *,
     status: str,
     error: str | None = None,
+    stage_delivery: dict[str, object] | None = None,
 ) -> None:
     _command_dir, ack_dir = control_paths(log_file)
     atomic_write_json(ack_dir / command_file.name, {
@@ -76,11 +83,18 @@ def acknowledge_control(
         "action": command["action"],
         "status": status,
         "error": error,
+        "stage_delivery": stage_delivery,
         "acknowledged_at": utc_now(),
     })
 
 
-def _wait_for_ack(path: Path, *, run_id: str, action: str) -> dict[str, object]:
+def _wait_for_ack(
+    path: Path,
+    *,
+    command_id: str,
+    run_id: str,
+    action: str,
+) -> dict[str, object]:
     deadline = time.monotonic() + CONTROL_WAIT_SECONDS
     while time.monotonic() < deadline:
         if path.exists():
@@ -91,7 +105,16 @@ def _wait_for_ack(path: Path, *, run_id: str, action: str) -> dict[str, object]:
                 raise RuntimeError(f"Run {run_id} {action} failed: {ack.get('error')}")
             return ack
         time.sleep(CONTROL_POLL_SECONDS)
-    raise RuntimeError(f"Run {run_id} worker did not acknowledge {action} within {CONTROL_WAIT_SECONDS}s")
+    return {
+        "status": "pending",
+        "command_id": command_id,
+        "run_id": run_id,
+        "action": action,
+        "message": (
+            f"Control request is durable but was not acknowledged within "
+            f"{CONTROL_WAIT_SECONDS}s"
+        ),
+    }
 
 
 def _validate_command(payload: dict[str, object], path: Path) -> None:

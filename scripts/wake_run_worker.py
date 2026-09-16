@@ -185,7 +185,7 @@ def _execute(
                 try:
                     if request.stage_plan_file is not None and deliver_stage is None:
                         raise RuntimeError("Stage delivery callback is required for a stage plan")
-                    exit_code, terminal_state, stage_error = supervise_owned_process(
+                    exit_code, terminal_state, stage_delivery = supervise_owned_process(
                         request,
                         process,
                         initial_log_offset=initial_log_offset,
@@ -200,7 +200,7 @@ def _execute(
                         started_at=started_at,
                         before_cpu=before_cpu,
                         terminal_state=terminal_state,
-                        stage_delivery_error=stage_error,
+                        stage_delivery=stage_delivery,
                     )
                 except Exception as wait_error:
                     error = _cleanup_failure(process, wait_error)
@@ -230,7 +230,7 @@ def _execution_result(
     started_at: float,
     before_cpu: tuple[float, float] | None,
     terminal_state: str = "completed",
-    stage_delivery_error: str | None = None,
+    stage_delivery: dict[str, object] | None = None,
 ) -> ExecutionResult:
     metrics = collect_metrics(started_at, before_cpu)
     return ExecutionResult(
@@ -241,7 +241,7 @@ def _execution_result(
         user_seconds=metrics.user_seconds,
         system_seconds=metrics.system_seconds,
         terminal_state=terminal_state,
-        stage_delivery_error=stage_delivery_error,
+        stage_delivery=stage_delivery,
     )
 
 
@@ -287,6 +287,7 @@ def _persist_completion(
     request: WorkerRequest,
     outcome: WorkerOutcome,
     wake_id: str,
+    *,
     goal_guard: dict[str, object],
 ) -> Path:
     return create_completion_event(
@@ -307,6 +308,7 @@ def _persist_completion(
         monitor_error=outcome.monitor_error,
         goal_guard=goal_guard,
         terminal_state=outcome.result.terminal_state,
+        stage_delivery=outcome.result.stage_delivery,
     )
 
 
@@ -384,7 +386,9 @@ def run_worker(
         return 0
     wake_id = uuid.uuid4().hex
     try:
-        completion_file = _persist_completion(request, outcome, wake_id, goal_guard)
+        completion_file = _persist_completion(
+            request, outcome, wake_id, goal_guard=goal_guard
+        )
     except Exception as error:
         state_error = _error_text(error)
         with open_private_log(request.log_file) as log:
@@ -419,8 +423,6 @@ def run_worker(
         return WORKER_DELIVERY_FAILURE
     if result.error is not None:
         return WORKER_STARTUP_FAILURE
-    if result.stage_delivery_error is not None:
-        return WORKER_DELIVERY_FAILURE
     if outcome.monitor_error is not None:
         return WORKER_MONITOR_FAILURE
     if runtime_error is not None:

@@ -125,7 +125,7 @@ python3 <skill-dir>/scripts/wake_run.py \
   --stage-plan /absolute/path/stages.json
 ```
 
-Only complete log lines are matched, and only the next unfinished stage is eligible. Each stage event is persisted before delivery with a stable `wake_id`; it does not release the Goal. Process termination still creates the final event. This first version intentionally excludes arbitrary script predicates, continuous model judgment, elapsed timers, and idle guesses.
+Only complete log lines are matched, only the next unfinished stage is eligible, and one line advances at most one stage. All events found by a scan become durable before its runtime checkpoint advances, then delivery is submitted. Event and terminal checkpoints are immediate; ordinary offset-only checkpoints are throttled to five seconds or 1 MiB. Stage delivery has a short 20-second retry window by default (`WAKE_RUN_STAGE_QUEUE_TIMEOUT`); at process exit, only the active attempt is allowed to finish and queued events remain pending for replay. Failures and pending counts are summarized by the final completion. Stage events use stable `wake_id` values and do not release the Goal. The exit observation is durable before the bounded active-attempt wait. This first version intentionally excludes arbitrary script predicates, continuous model judgment, elapsed timers, and idle guesses.
 
 ### Lifecycle control and recovery
 
@@ -135,7 +135,7 @@ python <skill-dir>/scripts/wake_run.py --detach <run_id>
 python <skill-dir>/scripts/wake_run.py --adopt <run_id>
 ```
 
-`stop` terminates the target process tree with TERM/KILL and emits a `cancelled` terminal wake. `detach` releases this Run's Goal holder before the worker exits; the target keeps running, with no promised exit status or final notification. `adopt` is only for a dead original worker with a still-live target. It rejects PID reuse by checking Linux boot ID and `/proc/<pid>/stat` starttime, then resumes unfinished stage observation. Because the new observer is not the target's parent, its final message explicitly reports `observer_mode: adopted` and `exact_exit_code_available: false`. A healthy run cannot be adopted.
+`stop` terminates the target process tree with TERM/KILL and emits a `cancelled` terminal wake. `detach` first drains the short delivery attempts for already-persisted stage events and reports their summary, then releases this Run's Goal holder before the worker exits; the target keeps running, with no promised exit status or final notification. A control command that is durable but not acknowledged within 15 seconds returns `status: pending` rather than a false failure. `adopt` is only for a dead original worker with a still-live target. Each attempt has a unique handshake and per-Run lock; a failed handoff rolls back Goal ownership. It rejects PID reuse by checking Linux boot ID and `/proc/<pid>/stat` starttime, then resumes unfinished stage observation. Target exit after the adopt gate becomes a normal `observed_exit`. Because the new observer is not the target's parent, its final message explicitly reports `observer_mode: adopted` and `exact_exit_code_available: false`. A healthy run cannot be adopted.
 
 `wall` is elapsed wall-clock time. `user` and `sys` are user-mode and kernel-mode CPU time. On Windows, process-tree CPU accounting is unavailable, so `user` and `sys` are omitted instead of presenting the PowerShell host's incomplete CPU time.
 
@@ -216,6 +216,7 @@ A few things worth knowing:
 | [`scripts/wake_run_goal.py`](./scripts/wake_run_goal.py) | Shared Goal leases, verification, conflict handling, and recovery. |
 | [`scripts/wake_run_goal_state.py`](./scripts/wake_run_goal_state.py) | Goal lease schema and holder phases. |
 | [`scripts/wake_run_stages.py`](./scripts/wake_run_stages.py) | Stage-plan validation and incremental log matching. |
+| [`scripts/wake_run_stage_commit.py`](./scripts/wake_run_stage_commit.py) | Durable event-before-checkpoint stage commits and checkpoint throttling. |
 | [`scripts/wake_run_supervisor.py`](./scripts/wake_run_supervisor.py) | Runtime stage scanning, delivery queue, and controls. |
 | [`scripts/wake_run_control.py`](./scripts/wake_run_control.py) | `stop` / `detach` commands and acknowledgements. |
 | [`scripts/wake_run_adopt.py`](./scripts/wake_run_adopt.py) | Validation and launch for Linux recovery observers. |
@@ -235,6 +236,7 @@ A few things worth knowing:
 | [`tests/test_process.py`](./tests/test_process.py) | POSIX and Windows process-tree cleanup tests. |
 | [`tests/test_goal_worker.py`](./tests/test_goal_worker.py) | Goal spawn-window, orphan, and blocking-lock tests. |
 | [`tests/test_lifecycle.py`](./tests/test_lifecycle.py) | Multi-stage, stop, detach, adopt, and replay integration tests. |
+| [`tests/test_reliability_review.py`](./tests/test_reliability_review.py) | Crash-window, delivery-order, control-timeout, and state-reporting regressions. |
 | [`references/economic-monitor.md`](./references/economic-monitor.md) | Economical-monitor plan and decision contract. |
 
 Run logs default to `.codex-wake-run/` in the project you launch from. This repository ignores that directory, but a host project does not inherit this repository's `.gitignore`; add `.codex-wake-run/` to the host project yourself. For large EDA projects, `--log-dir ~/.codex/wake-run/<project>` keeps frequently updated state off the source tree or NFS storage.

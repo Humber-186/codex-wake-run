@@ -97,13 +97,12 @@ class StageScanner:
         cursor = self.offset
         for raw_line in complete:
             cursor += len(raw_line)
-            while len(self.completed) < len(self.rules):
+            if len(self.completed) < len(self.rules):
                 rule = self.rules[len(self.completed)]
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not rule.matches(line):
-                    break
-                self.completed.append(rule.stage_id)
-                matches.append(StageMatch(rule.stage_id, line, cursor))
+                if rule.matches(line):
+                    self.completed.append(rule.stage_id)
+                    matches.append(StageMatch(rule.stage_id, line, cursor))
         self.offset += consumed
         return tuple(matches)
 

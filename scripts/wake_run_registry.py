@@ -9,7 +9,9 @@ from pathlib import Path
 from wake_run_state import atomic_write_json, process_is_alive, read_json, utc_now
 
 RUN_SCHEMA_VERSION = 1
-ACTIVE_STATES = frozenset({"launching", "prepared", "running", "orphaned", "lost"})
+ACTIVE_STATES = frozenset({
+    "launching", "prepared", "running", "reviewing", "orphaned", "lost",
+})
 
 
 def run_index_root() -> Path:
@@ -190,10 +192,11 @@ def _run_view(spec: dict[str, object], runtime: dict[str, object]) -> dict[str, 
         "monitor_policy": spec.get("monitor"),
         "monitor": completion.get("monitor") if completion else _monitor_runtime(spec),
         "delivery": completion.get("delivery") if completion else None,
+        "stage_delivery": completion.get("stage_delivery") if completion else None,
         "goal_guard": completion.get("goal_guard") if completion else runtime.get("goal_guard"),
         "observer_mode": completion.get("observer_mode") if completion else runtime.get("observer_mode"),
-        "exact_exit_code_available": (
-            completion.get("exact_exit_code_available") if completion else runtime.get("observer_mode") != "adopted"
+        "exact_exit_code_available": _exact_exit_code_available(
+            state, worker_alive, runtime, completion=completion
         ),
         "completed_stages": runtime.get("completed_stages", []),
         "next_stage": _next_stage(spec, runtime),
@@ -210,6 +213,22 @@ def _observed_state(state: str, worker_alive: bool, target_alive: bool) -> tuple
     if target_alive:
         return "orphaned", "worker_missing"
     return "lost", "worker_and_target_missing"
+
+
+def _exact_exit_code_available(
+    state: str,
+    worker_alive: bool,
+    runtime: dict[str, object],
+    *,
+    completion: dict[str, object] | None,
+) -> bool:
+    if completion is not None:
+        return completion.get("exact_exit_code_available") is True
+    return (
+        state == "running"
+        and worker_alive
+        and runtime.get("observer_mode") == "owned"
+    )
 
 
 def _elapsed_seconds(

@@ -21,6 +21,7 @@ def build_wake_message(
     monitor: dict[str, object] | None = None,
     terminal_state: str = "completed",
     observer_mode: str = "owned",
+    stage_delivery: dict[str, object] | None = None,
 ) -> str:
     lines = [
         COMPLETION_HEADER,
@@ -42,6 +43,13 @@ def build_wake_message(
         lines.append(f"state: {terminal_state}")
     if observer_mode == "adopted":
         lines.extend(["observer_mode: adopted", "exact_exit_code_available: false"])
+    if stage_delivery:
+        pending = stage_delivery.get("pending")
+        failed = stage_delivery.get("failed")
+        if isinstance(pending, int) and pending:
+            lines.append(f"pending_stage_events: {pending}")
+        if isinstance(failed, int) and failed:
+            lines.append(f"failed_stage_events: {failed}")
     lines.extend(_monitor_message_lines(monitor))
     return "\n".join(lines)
 
